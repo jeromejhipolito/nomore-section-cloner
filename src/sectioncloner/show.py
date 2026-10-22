@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import Page, sync_playwright
 
 from .agent import PRODUCT_HANDLE
-from .browser import HEIGHT, REBUILD_SELECTOR, UA, WIDTH
+from .browser import HEIGHT, REBUILD_SELECTOR, UA, WIDTH, open_storefront
 
 PHONE = {"viewport": {"width": WIDTH, "height": HEIGHT}, "user_agent": UA, "is_mobile": True, "has_touch": True}
 
@@ -23,12 +23,7 @@ def product_url() -> str:
 
 def tour(page: Page, url: str, password: str, hold: float = 6) -> None:
     """Log in to the storefront if needed, then a slow, readable scroll through the rebuilt sections."""
-    page.goto(url, wait_until="domcontentloaded")
-    if "/password" in page.url:
-        page.fill('input[type="password"]', password)
-        page.press('input[type="password"]', "Enter")
-        page.wait_for_load_state("domcontentloaded")
-        page.goto(url, wait_until="domcontentloaded")
+    open_storefront(page, url, password)
     el = page.wait_for_selector(REBUILD_SELECTOR, timeout=30000)
     page.wait_for_timeout(int(hold * 1000))
     end = page.evaluate("e => e.getBoundingClientRect().bottom + scrollY", el)

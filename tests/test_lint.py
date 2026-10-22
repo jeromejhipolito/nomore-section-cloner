@@ -1,7 +1,7 @@
 import json
 
 from sectioncloner import lint
-from sectioncloner.agent import SECTION_FILE, SECTION_TYPE, TEMPLATE_FILE, content_gaps
+from sectioncloner.agent import SECTION_FILE, SECTION_TYPE, TEMPLATE_FILE, TEMPLATE_KEY, content_gaps
 from sectioncloner.browser import Shot, Source
 
 SCHEMA = '{% schema %}{"name": "Landing", "settings": [{"type": "text", "id": "title", "label": "Title"}],' \
@@ -13,7 +13,7 @@ CLEAN = """
 {% for block in section.blocks %}<img src="{{ block.settings.image_url }}" alt="{{ block.settings.alt }}">{% endfor %}
 <svg viewBox="0 0 10 10"><text>5</text></svg>
 <span>&#9733;</span> | </div>
-{% style %}.x::after { content: "Hardcoded but CSS"; background: url(https://cdn.example.com/a.png); }{% endstyle %}
+{% style %}.x::after { content: "Hardcoded but CSS"; background: url({{ section.settings.bg | image_url }}); }{% endstyle %}
 <script>console.log("code, not copy")</script>
 """ + SCHEMA
 
@@ -52,12 +52,16 @@ def test_duplicate_setting_ids():
 
 
 def test_template_shape():
-    good = json.dumps({"sections": {"k": {"type": SECTION_TYPE}}, "order": ["k"]})
-    assert lint.check_template(good, SECTION_TYPE) == []
-    two = json.dumps({"sections": {"k": {"type": SECTION_TYPE}, "j": {"type": "main-product"}}, "order": ["k", "j"]})
-    assert lint.check_template(two, SECTION_TYPE)
-    assert lint.check_template("{", SECTION_TYPE)[0].startswith("template JSON")
-    assert lint.check_template(json.dumps({"sections": {"k": {"type": SECTION_TYPE}}, "order": []}), SECTION_TYPE)
+    k = TEMPLATE_KEY
+    good = json.dumps({"sections": {k: {"type": SECTION_TYPE}}, "order": [k]})
+    assert lint.check_template(good, SECTION_TYPE, k) == []
+    two = json.dumps({"sections": {k: {"type": SECTION_TYPE}, "j": {"type": "main-product"}}, "order": [k, "j"]})
+    assert lint.check_template(two, SECTION_TYPE, k)
+    assert lint.check_template("{", SECTION_TYPE, k)[0].startswith("template JSON")
+    assert lint.check_template(json.dumps({"sections": {k: {"type": SECTION_TYPE}}, "order": []}), SECTION_TYPE, k)
+    # the screenshot selector depends on the key, so a different key is rejected even with the right type
+    other = json.dumps({"sections": {"landing": {"type": SECTION_TYPE}}, "order": ["landing"]})
+    assert lint.check_template(other, SECTION_TYPE, k)
 
 
 def test_content_gaps_finds_missing_text_and_images():
@@ -76,3 +80,31 @@ def test_parse_template_strips_shopify_header():
     stored = "/*\n * IMPORTANT: The contents of this file are auto-generated.\n */\n{\"order\": [\"k\"]}"
     assert parse_template(stored) == {"order": ["k"]}
     assert parse_template('{"order": []}') == {"order": []}
+
+
+def test_liquid_string_literals_are_hardcoded_text():
+    assert any("Liquid string" in p for p in lint.check_section(CLEAN.replace(
+        "{{ section.settings.title }}", "{{ 'Buy now' | upcase }}")))
+    assert lint.check_section(CLEAN.replace("{{ section.settings.title }}", "{{ 'products.add' | t }}")) == []
+
+
+def test_remote_css_url_is_caught_but_setting_urls_pass():
+    bad = CLEAN.replace("url({{ section.settings.bg | image_url }})", "url(https://shop.example/cdn/shop/files/bg.jpg)")
+    assert "remote url(...) in CSS (put the image in a setting)" in lint.check_section(bad)
+    assert lint.check_section(CLEAN) == []
+
+
+def test_value_attribute_copy_is_caught_but_quantities_pass():
+    bad = CLEAN.replace("<span>", '<input type="submit" value="Add to cart"><span>')
+    assert any("value=" in p for p in lint.check_section(bad))
+    ok = CLEAN.replace("<span>", '<input type="hidden" name="quantity" value="2"><span>')
+    assert lint.check_section(ok) == []
+
+
+def test_content_gaps_no_false_positives_for_case_or_quotes():
+    src = Source(url="u", digest="", texts=['Say "hi" now'], images=["https://s.example/cdn/shop/files/IMG_01.jpg"],
+                 shot=Shot())
+    files = {SECTION_FILE: "", TEMPLATE_FILE: json.dumps({"t": 'Say "hi" now',
+                                                          "img": "https://s.example/cdn/shop/files/IMG_01.jpg"})}
+    gaps = content_gaps(src, files)
+    assert gaps["missing_texts"] == [] and gaps["missing_image_paths"] == []

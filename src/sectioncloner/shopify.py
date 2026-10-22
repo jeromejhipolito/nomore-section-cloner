@@ -8,6 +8,8 @@ import time
 import httpx
 
 API_VERSION = "2026-01"
+JOB_POLLS = 30
+SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
 class ShopifyError(RuntimeError):
@@ -56,11 +58,24 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
     data = admin.gql(
         """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
           themeFilesUpsert(themeId: $themeId, files: $files) {
-            upsertedThemeFiles { filename } userErrors { field message } } }""",
+            upsertedThemeFiles { filename } job { id done } userErrors { field message } } }""",
         {"themeId": theme_id,
          "files": [{"filename": n, "body": {"type": "TEXT", "value": v}} for n, v in files.items()]},
     )["themeFilesUpsert"]
     _raise_user_errors(data["userErrors"])
+    job = data.get("job")
+    for _ in range(JOB_POLLS):  # the write can finish in the background; a read-back before then sees old content
+        if not job or job.get("done"):
+            return
+        admin.sleep(1)
+        job = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job["id"]})["job"]
+    raise ShopifyError(f"theme write job {job['id']} still not done after {JOB_POLLS}s")
+
+
+def missing_scopes(admin: Admin, needed: set[str]) -> list[str]:
+    have = {s["handle"] for s in admin.gql("{ currentAppInstallation { accessScopes { handle } } }")
+            ["currentAppInstallation"]["accessScopes"]}
+    return sorted(needed - have)
 
 
 def read_files(admin: Admin, theme_id: str, names: list[str]) -> dict[str, str]:
@@ -90,8 +105,9 @@ def ensure_product(admin: Admin, handle: str, title: str, price: str, template_s
         {"id": {"handle": handle},
          "input": {"title": title, "handle": handle, "status": "ACTIVE", "templateSuffix": template_suffix,
                    "productOptions": [{"name": "Title", "values": [{"name": "Default Title"}]}],
+                   # CONTINUE: the placeholder has no stock, and Add to cart must still work.
                    "variants": [{"optionValues": [{"optionName": "Title", "name": "Default Title"}],
-                                 "price": price}]}},
+                                 "price": price, "inventoryPolicy": "CONTINUE"}]}},
     )["productSet"]
     _raise_user_errors(data["userErrors"])
     product_id = data["product"]["id"]

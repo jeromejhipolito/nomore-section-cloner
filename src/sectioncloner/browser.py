@@ -89,6 +89,11 @@ DIGEST_JS = r"""
 """
 
 
+BOTTOM_JS = """n => { const s = [...document.querySelectorAll('main > .shopify-section, main > section, main > div')]
+  .filter(e => e.offsetHeight > 0).slice(0, n); const l = s[s.length - 1];
+  return l ? l.getBoundingClientRect().bottom + scrollY : 0; }"""
+
+
 @dataclass
 class Shot:
     tiles: list[Path] = field(default_factory=list)
@@ -152,33 +157,43 @@ def scrape(url: str, n: int, out: Path, max_lines: int = 700) -> Source:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("main", timeout=30000)
+            # Scroll far enough for lazy images: measure where section N ends, settle to there, then re-measure.
             _settle(page, 4000)
+            bottom = page.evaluate(BOTTOM_JS, n)
+            if bottom > 4000:
+                _settle(page, int(bottom))
             data = page.evaluate(DIGEST_JS, [n, max_lines])
             if len(data["bands"]) < n:
                 raise RuntimeError(f"found only {len(data['bands'])} sections under <main>")
-            top = data["bands"][0]["top"]
-            height = sum(b["height"] for b in data["bands"])
-            shot = _tiles(page, top, height, out, "source")
+            first, last = data["bands"][0], data["bands"][-1]
+            # Span to the last section's bottom, so margins between sections are included.
+            shot = _tiles(page, first["top"], last["top"] + last["height"] - first["top"], out, "source")
         finally:
             browser.close()
     digest = data["digest"] + ("\n[digest truncated]" if data["truncated"] else "")
     return Source(url=url, digest=digest, images=data["images"], texts=data["texts"], shot=shot)
 
 
+def open_storefront(page: Page, url: str, password: str) -> None:
+    """Go to `url`, getting past a dev store's password page first."""
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    if "/password" not in page.url:
+        return
+    if not password:
+        raise RuntimeError("storefront is password-protected; set STOREFRONT_PASSWORD")
+    page.fill('input[type="password"]', password)
+    with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):  # the POST must land first
+        page.press('input[type="password"]', "Enter")
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    if "/password" in page.url:
+        raise RuntimeError("storefront password was rejected")
+
+
 def shoot_rebuild(product_url: str, password: str, out: Path, prefix: str) -> Shot:
     with sync_playwright() as p:
         browser, page = _page(p)
         try:
-            page.goto(product_url, wait_until="domcontentloaded", timeout=60000)
-            if "/password" in page.url:
-                if not password:
-                    raise RuntimeError("storefront is password-protected; set STOREFRONT_PASSWORD")
-                page.fill('input[type="password"]', password)
-                page.press('input[type="password"]', "Enter")
-                page.wait_for_load_state("domcontentloaded")
-                page.goto(product_url, wait_until="domcontentloaded", timeout=60000)
-                if "/password" in page.url:
-                    raise RuntimeError("storefront password was rejected")
+            open_storefront(page, product_url, password)
             el = page.wait_for_selector(REBUILD_SELECTOR, timeout=30000)
             box = el.bounding_box()
             _settle(page, int(box["y"] + box["height"]))

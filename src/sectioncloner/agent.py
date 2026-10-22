@@ -37,6 +37,8 @@ TEMPLATE_SUFFIX = "nomore"
 TEMPLATE_FILE = f"templates/product.{TEMPLATE_SUFFIX}.json"
 TEMPLATE_KEY = "nomore_landing"  # renders as id="shopify-section-template--…__nomore_landing"
 PRODUCT_HANDLE = "nomore-landing-placeholder"
+PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
+MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
 TOOL_NAMES = ["get_source", "write_files", "edit_file", "compare", "finish"]
 ALLOWED = [f"mcp__{SERVER}__{n}" for n in TOOL_NAMES]
@@ -123,6 +125,11 @@ def _err(msg: str) -> dict:
     return {"content": [{"type": "text", "text": f"ERROR: {msg}"}], "is_error": True}
 
 
+def _pre(msg: str) -> dict:
+    """A precondition refusal: reported to the agent like an error, but not charged to the tool's budget."""
+    return _err(msg) | {"_precondition": True}
+
+
 def guarded(run: Run, name: str):
     def wrap(fn):
         async def inner(args):
@@ -133,7 +140,10 @@ def guarded(run: Run, name: str):
                 return _err(f"budget for {name} exhausted ({BUDGET[name]}); call finish")
             try:
                 async with run.lock:
-                    return await fn(args)
+                    res = await fn(args)
+                if res.pop("_precondition", False):
+                    run.calls[name] -= 1
+                return res
             except Exception as e:  # noqa: BLE001 - the agent must see every failure as a tool error
                 run.log(f"{name} failed: {e}")
                 return _err(f"{type(e).__name__}: {e}")
@@ -145,19 +155,32 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s))).strip().lower()
 
 
+def _strings(v) -> list[str]:
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _strings(x)]
+    if isinstance(v, list):
+        return [s for x in v for s in _strings(x)]
+    return [v] if isinstance(v, str) else []
+
+
 def content_gaps(source: browser.Source, files: dict[str, str]) -> dict:
     """Source texts / image paths that never made it into the written files (fidelity hint for the agent)."""
-    blob = _norm(json.dumps(files, ensure_ascii=False).replace("\\n", " ").replace('\\"', '"'))
+    try:  # the template's real values, not its JSON text (which escapes quotes)
+        values = _strings(json.loads(files[TEMPLATE_FILE]))
+    except (json.JSONDecodeError, KeyError):
+        values = []
+    blob = _norm(" ".join(values + [files.get(SECTION_FILE, "")]))
     texts = [t for t in dict.fromkeys(source.texts) if len(t) > 2]
     missing_text = [t for t in texts if _norm(t) not in blob]
     paths = {urlparse(u).path for u in source.images if u.startswith("http")}
-    missing_img = [p for p in paths if p not in blob]
+    missing_img = sorted(p for p in paths if p.lower() not in blob)  # blob is lowercased by _norm
     return {"missing_texts": missing_text[:25], "missing_text_count": len(missing_text),
             "missing_image_paths": missing_img[:15], "missing_image_count": len(missing_img)}
 
 
 async def _write(run: Run, files: dict[str, str]) -> dict:
-    problems = lint.check_section(files[SECTION_FILE]) + lint.check_template(files[TEMPLATE_FILE], SECTION_TYPE)
+    problems = (lint.check_section(files[SECTION_FILE])
+                + lint.check_template(files[TEMPLATE_FILE], SECTION_TYPE, TEMPLATE_KEY))
     if problems:
         return _err("not written; fix these first:\n- " + "\n- ".join(problems[:30]))
     if run.theme_id is None:
@@ -175,12 +198,12 @@ async def _write(run: Run, files: dict[str, str]) -> dict:
         same_template = False
     if not same_template:
         return _err("read-back of the template differs from what was written")
+    if run.product_url is None:  # before marking the write done: compare needs a product page to open
+        await asyncio.to_thread(shopify.ensure_product, run.admin, PRODUCT_HANDLE, PRODUCT_TITLE, PRODUCT_PRICE,
+                                TEMPLATE_SUFFIX)
+        run.product_url = f"https://{run.admin.domain}/products/{PRODUCT_HANDLE}"
     run.files = files
     run.written_at = run.mutations
-    if run.product_url is None:
-        await asyncio.to_thread(shopify.ensure_product, run.admin, PRODUCT_HANDLE, "NoMore Colds (placeholder)",
-                                "49.00", TEMPLATE_SUFFIX)
-        run.product_url = f"https://{run.admin.domain}/products/{PRODUCT_HANDLE}"
     gaps = content_gaps(run.source, files) if run.source else {}
     run.log(f"wrote + read back {SECTION_FILE} ({len(files[SECTION_FILE])} chars), {TEMPLATE_FILE}; gaps={gaps}")
     return _ok({"written": True, "product_url": run.product_url, "content_gaps": gaps})
@@ -203,7 +226,7 @@ def build_tools(run: Run):
     @guarded(run, "write_files")
     async def write_files(args):
         if run.source is None:
-            return _err("call get_source first")
+            return _pre("call get_source first")
         return await _write(run, {SECTION_FILE: args["section_liquid"], TEMPLATE_FILE: args["template_json"]})
 
     @tool("edit_file", "Replace one exact, unique snippet in the last written file and re-write it. "
@@ -211,7 +234,7 @@ def build_tools(run: Run):
     @guarded(run, "edit_file")
     async def edit_file(args):
         if not run.files:
-            return _err("nothing written yet; use write_files")
+            return _pre("nothing written yet; use write_files")
         name = {"section": SECTION_FILE, "template": TEMPLATE_FILE}.get(args["file"])
         if name is None:
             return _err("file must be 'section' or 'template'")
@@ -223,8 +246,8 @@ def build_tools(run: Run):
     @tool("compare", "Screenshot the rebuilt section on the live store; returns source|rebuild pairs per band.", {})
     @guarded(run, "compare")
     async def compare(args):
-        if run.written_at is None or run.written_at != run.mutations:
-            return _err("nothing successfully written since the last change")
+        if run.written_at is None or run.written_at != run.mutations or run.product_url is None:
+            return _pre("nothing successfully written since the last change")
         i = run.calls["compare"]
         shot = await asyncio.to_thread(browser.shoot_rebuild, run.product_url, run.password, run.out, f"rebuild{i}")
         pairs = await asyncio.to_thread(browser.side_by_side, run.source.shot, shot, run.out, f"cmp{i}")
@@ -238,9 +261,9 @@ def build_tools(run: Run):
     @guarded(run, "finish")
     async def finish(args):
         if run.written_at != run.mutations:
-            return _err("the last change was not written successfully")
+            return _pre("the last change was not written successfully")
         if run.compared_at != run.mutations:
-            return _err("compare after your last change first")
+            return _pre("compare after your last change first")
         run.finished = True
         run.log(f"finish accepted: {args['report']}")
         return _ok({"accepted": True})
@@ -258,6 +281,7 @@ def options_for(run: Run, model: str) -> ClaudeAgentOptions:
         max_turns=MAX_TURNS,
         model=model,
         max_buffer_size=16 * 1024 * 1024,  # tool results carry screenshots; the 1MB default overflows
+        max_budget_usd=MAX_BUDGET_USD,
     )
 
 

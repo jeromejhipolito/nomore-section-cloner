@@ -7,6 +7,8 @@ import re
 from html.parser import HTMLParser
 
 SCHEMA_RE = re.compile(r"{%-?\s*schema\s*-?%}(.*?){%-?\s*endschema\s*-?%}", re.S)
+STYLE_BLOCKS = re.compile(r"{%-?\s*(style|stylesheet)\s*-?%}(.*?){%-?\s*end\1\s*-?%}|<style\b[^>]*>(.*?)</style\s*>",
+                          re.S | re.I)
 # Blocks whose contents are code, not visible copy.
 CODE_BLOCKS = re.compile(
     r"{%-?\s*(style|stylesheet|javascript|comment)\s*-?%}.*?{%-?\s*end\1\s*-?%}"
@@ -15,11 +17,13 @@ CODE_BLOCKS = re.compile(
     re.S | re.I,
 )
 LIQUID = re.compile(r"{{.*?}}|{%.*?%}", re.S)
-CONTENT_ATTRS = {"src", "srcset", "href", "alt", "title", "placeholder", "aria-label", "content", "poster"}
+# `{{ 'Buy now' }}` / `{{ "Buy" | upcase }}` is copy typed into the markup; `{{ 'x' | t }}` is a translation key.
+QUOTED_OUTPUT = re.compile(r"{{-?\s*(['\"])([^'\"]*[A-Za-z][^'\"]*)\1(?![^}]*\|\s*(?:t|asset_url)\b)[^}]*}}")
+CSS_REMOTE_URL = re.compile(r"url\(\s*['\"]?\s*(?:https?:)?//", re.I)
+TEXT_ATTRS = {"alt", "title", "placeholder", "aria-label", "content", "value"}
+URL_ATTRS = {"src", "srcset", "href", "poster"}
 LITERAL_URL = re.compile(r"https?://|//[\w.-]+\.\w+/|cdn/shop/", re.I)
-
-
-MARK = "\u2063"  # stands in for a Liquid tag/output, so `alt="{{ x }}"` isn't a literal
+MARK = "⁣"  # stands in for a Liquid tag/output, so `alt="{{ x }}"` isn't a literal
 
 
 class _Collector(HTMLParser):
@@ -30,14 +34,17 @@ class _Collector(HTMLParser):
     def handle_data(self, data):
         text = data.strip()
         if re.search(r"[A-Za-z0-9]", text.replace(MARK, "")):
-            self.problems.append(f"hardcoded text: {text[:60]!r}")
+            self.problems.append(f"hardcoded text: {text.replace(MARK, '{{…}}')[:60]!r}")
 
     def handle_starttag(self, tag, attrs):
         for k, v in attrs:
             literal = (v or "").replace(MARK, "").strip()
-            if k in CONTENT_ATTRS and literal:
-                if k in ("alt", "title", "placeholder", "aria-label", "content") or LITERAL_URL.search(literal):
-                    self.problems.append(f"hardcoded {k}= on <{tag}>: {v[:60]!r}")
+            if not literal:
+                continue
+            # value="1" (a quantity) is fine; value="Add to cart" is copy.
+            if (k in TEXT_ATTRS and (k != "value" or re.search(r"[A-Za-z]", literal))) or (
+                    k in URL_ATTRS and LITERAL_URL.search(literal)):
+                self.problems.append(f"hardcoded {k}= on <{tag}>: {literal[:60]!r}")
 
 
 def split_schema(liquid: str) -> tuple[str, dict]:
@@ -54,11 +61,13 @@ def check_section(liquid: str) -> list[str]:
     except (ValueError, json.JSONDecodeError) as e:
         return [f"schema: {e}"]
     problems = _check_schema(schema)
-    # Liquid tags become a neutral placeholder so `alt="{{ x }}"` doesn't count as a literal.
-    stripped = LIQUID.sub("⁣", CODE_BLOCKS.sub("", markup))
+    problems += [f"hardcoded text in a Liquid string: {m.group(2)[:60]!r}" for m in QUOTED_OUTPUT.finditer(markup)]
+    for m in STYLE_BLOCKS.finditer(markup):
+        if CSS_REMOTE_URL.search(LIQUID.sub("", m.group(2) or m.group(3) or "")):
+            problems.append("remote url(...) in CSS (put the image in a setting)")
     c = _Collector()
-    c.feed(stripped)
-    problems += [p for p in c.problems if "⁣" not in p]
+    c.feed(LIQUID.sub(MARK, CODE_BLOCKS.sub("", markup)))
+    problems += c.problems
     if LITERAL_URL.search(LIQUID.sub("", CODE_BLOCKS.sub("", markup))):
         problems.append("literal URL in markup (put it in a setting)")
     return problems
@@ -77,20 +86,15 @@ def _check_schema(schema: dict) -> list[str]:
     return problems
 
 
-def check_template(template_json: str, section_type: str) -> list[str]:
+def check_template(template_json: str, section_type: str, key: str) -> list[str]:
     try:
         t = json.loads(template_json)
     except json.JSONDecodeError as e:
         return [f"template JSON: {e}"]
     sections = t.get("sections", {})
-    types = [s.get("type") for s in sections.values()]
-    if types != [section_type]:
-        return [f"template must contain exactly one section of type {section_type!r}, got {types}"]
-    if t.get("order") != list(sections):
-        return ["template 'order' must list the section key"]
+    if list(sections) != [key] or sections[key].get("type") != section_type:
+        found = {k: v.get("type") for k, v in sections.items()}
+        return [f"template must contain exactly one section, key {key!r}, type {section_type!r}; got {found}"]
+    if t.get("order") != [key]:
+        return [f"template 'order' must be [{key!r}]"]
     return []
-
-
-def coverage(values: str, wanted: list[str]) -> list[str]:
-    """Which wanted strings (source texts / image URLs) never appear in the written values."""
-    return [w for w in wanted if w not in values]

@@ -1,0 +1,84 @@
+"""Offline tests for the finish gate, budget refunds and the Admin client (fake HTTP, no store, no LLM)."""
+
+import asyncio
+import json
+from pathlib import Path
+
+import httpx
+
+from sectioncloner import shopify
+from sectioncloner.agent import BUDGET, Run, build_tools
+
+
+class FakeAdmin:
+    domain = "x.myshopify.com"
+
+
+def _tools(tmp_path: Path):
+    run = Run(url="https://shop.example/products/a", admin=FakeAdmin(), password="", out=tmp_path)
+    return run, {t.name: t.handler for t in build_tools(run)}
+
+
+def _call(handler, args=None):
+    return asyncio.run(handler(args or {}))
+
+
+def test_compare_and_finish_refused_before_any_write_without_spending_budget(tmp_path):
+    run, tools = _tools(tmp_path)
+    for _ in range(BUDGET["compare"] + 2):
+        assert _call(tools["compare"]).get("is_error")
+    assert run.calls["compare"] == 0  # refusals are not charged
+    assert _call(tools["finish"], {"report": "x"}).get("is_error")
+    assert not run.done()
+
+
+def test_finish_needs_a_compare_after_the_last_write(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.mutations = run.written_at = 2
+    run.product_url = "https://x.myshopify.com/products/p"
+    run.compared_at = 1  # compared an older version
+    assert _call(tools["finish"], {"report": "x"}).get("is_error")
+    run.compared_at = 2
+    assert not _call(tools["finish"], {"report": "x"}).get("is_error")
+    assert run.done()
+    assert _call(tools["compare"]).get("is_error")  # nothing is accepted after finish
+
+
+def _admin(responses: list, sent: list):
+    def handler(request: httpx.Request):
+        sent.append(json.loads(request.content))
+        status, body = responses.pop(0)
+        return httpx.Response(status, json=body)
+    return shopify.Admin("x.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(handler)),
+                         sleep=lambda s: None)
+
+
+def test_gql_retries_throttling():
+    sent = []
+    a = _admin([(429, {}), (200, {"errors": [{"extensions": {"code": "THROTTLED"}}]}), (200, {"data": {"ok": 1}})],
+               sent)
+    assert a.gql("{ ok }") == {"ok": 1} and len(sent) == 3
+
+
+def test_upsert_waits_for_the_background_job():
+    sent = []
+    a = _admin([(200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [],
+                                                     "job": {"id": "gid://shopify/Job/1", "done": False}}}}),
+                (200, {"data": {"job": {"id": "gid://shopify/Job/1", "done": False}}}),
+                (200, {"data": {"job": {"id": "gid://shopify/Job/1", "done": True}}})], sent)
+    shopify.upsert_files(a, "gid://shopify/OnlineStoreTheme/1", {"sections/x.liquid": "{{ x }}"})
+    assert len(sent) == 3
+
+
+def test_placeholder_product_is_idempotent_and_sellable():
+    sent = []
+    product = {"data": {"productSet": {"product": {"id": "gid://shopify/Product/9", "onlineStoreUrl": None},
+                                       "userErrors": []}}}
+    pubs = {"data": {"publications": {"nodes": [{"id": "gid://shopify/Publication/1", "name": "Online Store"}]}}}
+    publish = {"data": {"publishablePublish": {"userErrors": []}}}
+    a = _admin([(200, product), (200, pubs), (200, publish)] * 2, sent)
+    ids = [shopify.ensure_product(a, "h", "T", "1.00", "nomore") for _ in range(2)]
+    assert ids[0] == ids[1]
+    first, second = sent[0]["variables"], sent[3]["variables"]
+    assert first == second and first["id"] == {"handle": "h"}
+    assert first["input"]["variants"][0]["inventoryPolicy"] == "CONTINUE"

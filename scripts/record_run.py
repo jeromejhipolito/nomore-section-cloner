@@ -42,7 +42,7 @@ body{margin:0;background:#0d1117;color:#c9d1d9;font:13px/1.45 ui-monospace,Menlo
 #side{width:420px;border-left:1px solid #30363d;padding:12px;display:flex;flex-direction:column;gap:6px}
 #side h4{margin:0;color:#8b949e;font-weight:normal}#side img{width:100%;border-radius:4px}
 </style><div id=term><div id=bar>~/nomore-section-cloner &nbsp;·&nbsp; <span id=clock>00:00</span></div>
-<div id=log><span class=cmd>$ uv run python -m sectioncloner https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis</span>\n</div></div>
+<div id=log><span class=cmd>$ uv run python -m sectioncloner {CMD_URL}</span>\n</div></div>
 <div id=side><h4>Agent's latest compare: original | rebuild (390px)</h4><img id=cmp></div>
 <script>
 const log = document.getElementById('log'), t0 = Date.now();
@@ -73,7 +73,7 @@ def classify(line: str) -> str:
 
 class Run:
     def __init__(self, url: str):
-        self.url, self.exit, self.lines, self.images = url, None, [], []
+        self.url, self.exit, self.lines, self.images, self.proc = url, None, [], [], None
         self.cond = threading.Condition()
 
     def start(self) -> None:
@@ -86,8 +86,8 @@ class Run:
 
     def _run(self) -> None:
         env = os.environ | {"PYTHONUNBUFFERED": "1"}
-        proc = subprocess.Popen([sys.executable, "-m", "sectioncloner", self.url], cwd=ROOT, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = self.proc = subprocess.Popen([sys.executable, "-m", "sectioncloner", self.url], cwd=ROOT, env=env,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         threading.Thread(target=self._watch_images, args=(proc,), daemon=True).start()
         for raw in proc.stdout:
             line = ANSI.sub("", raw.rstrip("\n"))
@@ -113,7 +113,7 @@ def serve(run: Run) -> ThreadingHTTPServer:
 
         def do_GET(self):
             if self.path == "/":
-                body = PAGE.encode()
+                body = PAGE.replace("{CMD_URL}", html.escape(run.url)).encode()
                 self.send_response(200), self.send_header("Content-Type", "text/html"), self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/events":
@@ -157,6 +157,15 @@ def main() -> int:
     vids = ROOT / "runs" / f"video-{time.strftime('%Y%m%d-%H%M%S')}"
     run = Run(args.url)
     srv = serve(run)
+    try:
+        return _record(run, srv, vids, args.out)
+    finally:  # never leave the agent running (and spending) unwatched if recording fails or times out
+        if run.proc and run.proc.poll() is None:
+            run.proc.terminate()
+        srv.shutdown()
+
+
+def _record(run: Run, srv, vids: Path, out: str) -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         ctx = browser.new_context(viewport=SIZE, record_video_dir=str(vids / "term"), record_video_size=SIZE)
@@ -174,16 +183,15 @@ def main() -> int:
         tour(phone.new_page(), product_url(), os.getenv("STOREFRONT_PASSWORD", ""), hold=4)
         phone.close()
         browser.close()
-    srv.shutdown()
     term, ph = next((vids / "term").glob("*.webm")), next((vids / "phone").glob("*.webm"))
     # Phone clip centred on the same 1280x800 canvas, then both joined into one h264 mp4.
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(term), "-i", str(ph), "-filter_complex",
                     "[0:v]fps=30,format=yuv420p,setsar=1[a];"
                     "[1:v]scale=-2:780,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,fps=30,format=yuv420p,"
                     "setsar=1[b];[a][b]concat=n=2:v=1[v]",
-                    "-map", "[v]", "-c:v", "libx264", "-crf", "23", "-movflags", "+faststart", args.out],
+                    "-map", "[v]", "-c:v", "libx264", "-crf", "23", "-movflags", "+faststart", out],
                    check=True, cwd=ROOT)
-    print(f"video: {ROOT / args.out}")
+    print(f"video: {ROOT / out}")
     return 0
 
 
