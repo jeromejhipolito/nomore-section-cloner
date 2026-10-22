@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import httpx
 
 API_VERSION = "2026-01"
 JOB_POLLS = 120  # seconds; Shopify's theme job queue can be slow
+# One theme write at a time, for the whole process: an upload left running by a cancelled tool call, or a job
+# that outlived its polling, finishes BEFORE the next write (e.g. the final restore) starts, so it can't land after.
+_UPLOAD_LOCK = threading.Lock()
+_pending_jobs: list[str] = []  # theme write jobs we stopped polling before they were done
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
@@ -76,6 +81,22 @@ def main_theme_id(admin: Admin) -> str:
 
 def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
     """Write text files to the theme. Shopify validates Liquid/JSON here and returns userErrors."""
+    with _UPLOAD_LOCK:
+        while _pending_jobs:  # an earlier write still running on Shopify's side must not land after this one
+            _wait_job(admin, _pending_jobs[0])
+            _pending_jobs.pop(0)
+        _upsert(admin, theme_id, files)
+
+
+def _wait_job(admin: Admin, job_id: str) -> None:
+    for _ in range(JOB_POLLS):
+        if admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id})["job"]["done"]:
+            return
+        admin.sleep(1)
+    raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s")
+
+
+def _upsert(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
     data = admin.gql(
         """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
           themeFilesUpsert(themeId: $themeId, files: $files) {
@@ -85,12 +106,13 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
     )["themeFilesUpsert"]
     _raise_user_errors(data["userErrors"])
     job = data.get("job")
-    for _ in range(JOB_POLLS):  # the write can finish in the background; a read-back before then sees old content
-        if not job or job.get("done"):
-            return
-        admin.sleep(1)
-        job = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job["id"]})["job"]
-    raise ShopifyTransientError(f"theme write job {job['id']} still not done after {JOB_POLLS}s")
+    if not job or job.get("done"):
+        return
+    try:  # the write can finish in the background; a read-back before then sees old content
+        _wait_job(admin, job["id"])
+    except ShopifyTransientError:
+        _pending_jobs.append(job["id"])  # the next write waits for it first
+        raise
 
 
 def missing_scopes(admin: Admin, needed: set[str]) -> list[str]:

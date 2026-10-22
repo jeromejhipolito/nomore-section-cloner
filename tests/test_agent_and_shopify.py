@@ -270,3 +270,27 @@ def test_graphql_internal_errors_are_transient():
         pass
     else:
         raise AssertionError("expected ShopifyTransientError")
+
+
+def test_a_job_that_outlived_polling_finishes_before_the_next_write(monkeypatch):
+    monkeypatch.setattr(shopify, "JOB_POLLS", 2)
+    monkeypatch.setattr(shopify, "_pending_jobs", [])
+    pending = {"data": {"job": {"id": "gid://shopify/Job/1", "done": False}}}
+    sent = []
+    a = _admin([
+        (200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [],
+                                             "job": {"id": "gid://shopify/Job/1", "done": False}}}}),
+        (200, pending), (200, pending),                                   # polling gives up: job 1 still running
+        (200, {"data": {"job": {"id": "gid://shopify/Job/1", "done": True}}}),  # next write waits for job 1 first
+        (200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}}),
+    ], sent)
+    try:
+        shopify.upsert_files(a, "gid://shopify/OnlineStoreTheme/1", {"sections/x.liquid": "1"})
+    except shopify.ShopifyTransientError:
+        pass
+    else:
+        raise AssertionError("expected the job timeout to be transient")
+    assert shopify._pending_jobs == ["gid://shopify/Job/1"]
+    shopify.upsert_files(a, "gid://shopify/OnlineStoreTheme/1", {"sections/x.liquid": "2"})  # e.g. the restore
+    kinds = ["upsert" if "themeFilesUpsert" in q["query"] else "job" for q in sent]
+    assert kinds == ["upsert", "job", "job", "job", "upsert"] and shopify._pending_jobs == []

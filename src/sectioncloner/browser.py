@@ -157,7 +157,10 @@ def scrape(url: str, n: int, out: Path, max_lines: int = 700) -> Source:
         browser, page = _page(p)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_selector("main", timeout=30000)
+            try:
+                page.wait_for_selector("main", timeout=30000)
+            except PlaywrightTimeout:  # charged: a page without <main> won't start working on a retry
+                raise RuntimeError("the source page has no <main> element (not a standard Shopify theme?)") from None
             # Scroll far enough for lazy images: measure where section N ends, settle to there, then re-measure.
             _settle(page, 4000)
             bottom = page.evaluate(BOTTOM_JS, n)
