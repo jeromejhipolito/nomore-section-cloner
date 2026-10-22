@@ -13,7 +13,7 @@ CLEAN = """
 {% for block in section.blocks %}<img src="{{ block.settings.image_url }}" alt="{{ block.settings.alt }}">{% endfor %}
 <svg viewBox="0 0 10 10"><text>5</text></svg>
 <span>&#9733;</span> | </div>
-{% style %}.x::after { content: "Hardcoded but CSS"; background: url({{ section.settings.bg | image_url }}); }{% endstyle %}
+{% style %}.x::after { content: ""; background: url({{ section.settings.bg | image_url }}); }{% endstyle %}
 <script>console.log("code, not copy")</script>
 """ + SCHEMA
 
@@ -122,3 +122,20 @@ def test_machine_keys_in_liquid_and_radio_values_pass():
                        "{{ section.settings.font | font_face: font_display: 'swap' }}"
                        '<input type="radio" name="bundle" value="two-pack">{{ \'products.add\' | t }}')
     assert lint.check_section(ok) == []
+
+
+def test_copy_in_css_content_is_caught_but_markup_args_are_not():
+    bad = CLEAN.replace('content: "";', 'content: "BEST SELLER";')
+    assert any("CSS content" in p for p in lint.check_section(bad))
+    ok = CLEAN.replace("{{ section.settings.title }}",
+                       "{{ section.settings.img | image_url: width: 800 | image_tag: sizes: '(min-width: 750px) 50vw' }}"
+                       "{%- form 'product', product, id: 'ProductForm' -%}{%- endform -%}")
+    assert lint.check_section(ok) == []
+
+
+def test_text_input_value_is_copy_and_odd_shapes_are_refused_cleanly():
+    bad = CLEAN.replace("<span>", '<input value="Enter your email"><span>')
+    assert any("value=" in p for p in lint.check_section(bad))
+    assert lint.check_template("[]", SECTION_TYPE, TEMPLATE_KEY)
+    assert lint.check_template(json.dumps({"sections": {TEMPLATE_KEY: "x"}}), SECTION_TYPE, TEMPLATE_KEY)
+    assert lint.check_section("{% schema %}[]{% endschema %}") == ["schema: must be a JSON object"]

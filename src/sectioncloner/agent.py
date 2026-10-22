@@ -43,7 +43,7 @@ MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
 TOOL_NAMES = ["get_source", "write_files", "edit_file", "compare", "finish"]
 ALLOWED = [f"mcp__{SERVER}__{n}" for n in TOOL_NAMES]
-MAX_TURNS = 40
+MAX_TURNS = 60  # above the charged budgets (38) plus room for free refusals
 # Hard per-tool ceilings. `compare` is the visual iteration cap.
 BUDGET = {"get_source": 2, "write_files": 4, "edit_file": 25, "compare": 4, "finish": 3}
 
@@ -126,6 +126,14 @@ def _ok(data, images: list[Path] = ()) -> dict:
 
 def _err(msg: str) -> dict:
     return {"content": [{"type": "text", "text": f"ERROR: {msg}"}], "is_error": True}
+
+
+LAST_COMPARE_USED = ("all compares are used: a change now could never be checked, so the files stay as last "
+                     "compared; call finish and list what still differs")
+
+
+def no_compares_left(run: "Run") -> bool:
+    return run.calls["compare"] >= BUDGET["compare"]
 
 
 def fmt_cost(cost: float | None) -> str:
@@ -241,6 +249,8 @@ def build_tools(run: Run):
     async def write_files(args):
         if run.source is None:
             return _pre("call get_source first")
+        if no_compares_left(run):
+            return _pre(LAST_COMPARE_USED)
         return await _write(run, {SECTION_FILE: args["section_liquid"], TEMPLATE_FILE: args["template_json"]})
 
     @tool("edit_file", "Replace one exact, unique snippet in the last written file and re-write it. "
@@ -249,6 +259,8 @@ def build_tools(run: Run):
     async def edit_file(args):
         if not run.files:
             return _pre("nothing written yet; use write_files")
+        if no_compares_left(run):
+            return _pre(LAST_COMPARE_USED)
         name = {"section": SECTION_FILE, "template": TEMPLATE_FILE}.get(args["file"])
         if name is None:
             return _err("file must be 'section' or 'template'")
@@ -263,7 +275,9 @@ def build_tools(run: Run):
         if run.written_at is None or run.written_at != run.mutations or run.product_url is None:
             return _pre("nothing successfully written since the last change")
         i = run.calls["compare"]
-        shot = await asyncio.to_thread(browser.shoot_rebuild, run.product_url, run.password, run.out, f"rebuild{i}")
+        # ?_v=<mutations> skips any storefront page cache that still holds the previous render
+        url = f"{run.product_url}?_v={run.mutations}"
+        shot = await asyncio.to_thread(browser.shoot_rebuild, url, run.password, run.out, f"rebuild{i}")
         pairs = await asyncio.to_thread(browser.side_by_side, run.source.shot, shot, run.out, f"cmp{i}")
         run.compared_at = run.mutations
         run.rebuild_height = shot.height

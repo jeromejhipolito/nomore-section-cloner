@@ -136,3 +136,26 @@ def test_cost_is_unknown_not_zero_when_the_sdk_never_reported_it(tmp_path):
     run, _ = _tools(tmp_path)
     assert run.cost is None and fmt_cost(run.cost).startswith("unknown")
     assert fmt_cost(2.6608) == "$2.6608"
+
+
+def test_no_writes_after_the_last_compare(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=1))
+    run.files = {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}
+    run.calls["compare"] = BUDGET["compare"]
+    assert _call(tools["edit_file"], {"file": "section", "old": "a", "new": "b"}).get("is_error")
+    assert _call(tools["write_files"], {"section_liquid": "a", "template_json": "{}"}).get("is_error")
+    assert run.mutations == 0 and run.calls["edit_file"] == 0 and run.calls["write_files"] == 0
+
+
+def test_network_errors_become_a_clean_shopify_error():
+    def boom(request):
+        raise httpx.ConnectError("dns")
+    a = shopify.Admin("nope.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(boom)),
+                      sleep=lambda s: None)
+    try:
+        a.gql("{ shop { name } }")
+    except shopify.ShopifyError as e:
+        assert "cannot reach nope.myshopify.com" in str(e)
+    else:
+        raise AssertionError("expected ShopifyError")

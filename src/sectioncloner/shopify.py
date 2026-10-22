@@ -26,8 +26,17 @@ class Admin:
 
     def gql(self, query: str, variables: dict | None = None) -> dict:
         for attempt in range(5):
-            r = self.http.post(self.url, json={"query": query, "variables": variables or {}}, headers=self.headers)
-            body = r.json() if r.status_code == 200 else None
+            try:
+                r = self.http.post(self.url, json={"query": query, "variables": variables or {}},
+                                   headers=self.headers)
+                body = r.json() if r.status_code == 200 else None
+            except httpx.TransportError as e:  # DNS / reset / timeout: retry, then a clean error
+                if attempt < 4:
+                    self.sleep(min(2**attempt, 20))
+                    continue
+                raise ShopifyError(f"cannot reach {self.domain}: {e}") from e
+            except ValueError as e:  # a 200 that isn't JSON (an HTML interstitial)
+                raise ShopifyError(f"Admin API returned non-JSON: {r.text[:200]}") from e
             throttled = body is not None and any(
                 (e.get("extensions") or {}).get("code") == "THROTTLED" for e in body.get("errors") or [])
             if r.status_code == 429 or throttled:

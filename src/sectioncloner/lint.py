@@ -25,6 +25,10 @@ TEXT_ATTRS = {"alt", "title", "placeholder", "aria-label", "content", "value"}
 URL_ATTRS = {"src", "srcset", "href", "poster"}
 LITERAL_URL = re.compile(r"https?://|//[\w.-]+\.\w+/|cdn/shop/", re.I)
 MARK = "⁣"  # stands in for a Liquid tag/output, so `alt="{{ x }}"` isn't a literal
+VISIBLE_VALUE_TYPES = {"submit", "button", "reset", "text", "email", "search", "tel", "url"}
+# Literal arguments that are markup, not copy: `image_tag: sizes: '(min-width: 750px) 50vw'`, `date: '%b %d'`, …
+NON_COPY_ARG = re.compile(r"\b(sizes|date|class|id|format|font_display|loading|widths|media|rel|target)\s*:\s*$")
+CSS_CONTENT = re.compile(r"content\s*:\s*(['\"])(.*?)\1", re.S)
 
 
 class _Collector(HTMLParser):
@@ -43,7 +47,8 @@ class _Collector(HTMLParser):
             if not literal:
                 continue
             # value= is visible only on buttons; on radios/hidden inputs it is a key ("two-pack", "2").
-            visible_value = tag in ("button", "input") and dict(attrs).get("type") in ("submit", "button", "reset")
+            itype = (dict(attrs).get("type") or "text").lower()
+            visible_value = tag == "button" or (tag == "input" and itype in VISIBLE_VALUE_TYPES)
             if (k in TEXT_ATTRS and (k != "value" or (visible_value and re.search(r"[A-Za-z]", literal)))) or (
                     k in URL_ATTRS and LITERAL_URL.search(literal)):
                 self.problems.append(f"hardcoded {k}= on <{tag}>: {literal[:60]!r}")
@@ -62,16 +67,23 @@ def check_section(liquid: str) -> list[str]:
         markup, schema = split_schema(liquid)
     except (ValueError, json.JSONDecodeError) as e:
         return [f"schema: {e}"]
+    if not isinstance(schema, dict):
+        return ["schema: must be a JSON object"]
     problems = _check_schema(schema)
     for tag in LIQUID.finditer(CODE_BLOCKS.sub("", markup)):
         for m in LIQUID_LITERAL.finditer(tag.group(0)):
             lit = m.group(1) if m.group(1) is not None else m.group(2)
             translated = re.match(r"\s*\|\s*t\b", tag.group(0)[m.end():])
-            if re.search(r"[A-Za-z]", lit) and (" " in lit or lit.lstrip()[:1].isupper()) and not translated:
+            markup_arg = NON_COPY_ARG.search(tag.group(0)[:m.start()]) or re.match(r"{%-?\s*form\b", tag.group(0))
+            if (re.search(r"[A-Za-z]", lit) and (" " in lit or lit.lstrip()[:1].isupper())
+                    and not translated and not markup_arg):
                 problems.append(f"hardcoded text in a Liquid string: {lit[:60]!r}")
     for m in STYLE_BLOCKS.finditer(markup):
-        if CSS_REMOTE_URL.search(LIQUID.sub("", m.group(2) or m.group(3) or "")):
+        css = LIQUID.sub("", m.group(2) or m.group(3) or "")
+        if CSS_REMOTE_URL.search(css):
             problems.append("remote url(...) in CSS (put the image in a setting)")
+        problems += [f"hardcoded text in CSS content: {c.group(2)[:60]!r}" for c in CSS_CONTENT.finditer(css)
+                     if re.search(r"[A-Za-z0-9]", c.group(2))]
     c = _Collector()
     c.feed(LIQUID.sub(MARK, CODE_BLOCKS.sub("", markup)))
     problems += c.problems
@@ -98,7 +110,9 @@ def check_template(template_json: str, section_type: str, key: str) -> list[str]
         t = json.loads(template_json)
     except json.JSONDecodeError as e:
         return [f"template JSON: {e}"]
-    sections = t.get("sections", {})
+    sections = t.get("sections") if isinstance(t, dict) else None
+    if not isinstance(sections, dict) or not all(isinstance(v, dict) for v in sections.values()):
+        return ["template must be an object with a 'sections' object of section objects"]
     if list(sections) != [key] or sections[key].get("type") != section_type:
         found = {k: v.get("type") for k, v in sections.items()}
         return [f"template must contain exactly one section, key {key!r}, type {section_type!r}; got {found}"]
