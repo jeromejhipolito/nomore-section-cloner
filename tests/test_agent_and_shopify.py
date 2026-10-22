@@ -188,7 +188,7 @@ def test_finish_accepted_when_no_budget_path_remains_then_settle_decides_the_exi
     assert not _call(tools["finish"], {"report": "x"}).get("is_error") and run.finished
     monkeypatch.setattr(shopify, "upsert_files", lambda a, t, f: (_ for _ in ()).throw(shopify.ShopifyError("no")))
     asyncio.run(agent.settle(run))
-    assert agent.exit_code(run) == agent.EXIT_PARTIAL and run.partial  # could not put it back: partial
+    assert agent.exit_code(run) == agent.EXIT_PARTIAL  # could not put it back: partial
 
 
 def test_finish_still_refused_while_a_path_to_current_exists(tmp_path):
@@ -213,7 +213,9 @@ def test_finish_reachable_when_the_scrape_never_succeeds(tmp_path):
 
 def test_only_infra_crashes_are_forgiven():
     from sectioncloner.agent import is_transient
-    assert is_transient(TimeoutError()) and is_transient(httpx.ConnectError("x"))
+    assert is_transient(TimeoutError()) and is_transient(ConnectionError())
+    assert not is_transient(PermissionError())  # a local disk error is not infra trouble
+    # raw httpx errors never reach the agent: Admin.gql wraps them (see test_network_errors_become_...)
     assert is_transient(shopify.ShopifyTransientError("Admin API HTTP 502: bad gateway"))
     assert not is_transient(shopify.ShopifyError("files.0: Liquid syntax error"))  # the agent's own mistake
     assert not is_transient(shopify.ShopifyError("throttled"))  # typed, not matched on message text
@@ -241,3 +243,30 @@ def test_settle_puts_the_last_compared_version_back_however_the_session_ended(tm
 def test_exit_codes(tmp_path):
     from sectioncloner.agent import EXIT_PARTIAL
     assert EXIT_PARTIAL == 3  # distinct from the CLI's 2 (usage/config) and 1 (never finished)
+
+
+def test_sdk_error_after_a_cap_still_settles_and_exits_from_state(tmp_path, monkeypatch):
+    from sectioncloner import agent
+
+    async def fake_query(prompt, options):  # what the SDK does on error_max_budget_usd: result, then raise
+        run.finished = True
+        yield agent.ResultMessage(subtype="error_max_budget_usd", duration_ms=1, duration_api_ms=1, is_error=True,
+                                  num_turns=9, session_id="s", total_cost_usd=4.51)
+        raise RuntimeError("Claude Code exited with code 1")
+    run, _ = _tools(tmp_path)
+    run.good = run.files = {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}
+    run.mutations = run.written_at = run.compared_at = 1
+    monkeypatch.setattr(agent, "query", fake_query)
+    assert asyncio.run(agent.run_agent(run, "m")) == 0  # finished on a compared version: done, no traceback
+    assert run.cost == 4.51
+
+
+def test_graphql_internal_errors_are_transient():
+    sent = []
+    a = _admin([(200, {"errors": [{"message": "x", "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]})], sent)
+    try:
+        a.gql("{ shop { name } }")
+    except shopify.ShopifyTransientError:
+        pass
+    else:
+        raise AssertionError("expected ShopifyTransientError")

@@ -196,9 +196,13 @@ def shoot_rebuild(product_url: str, password: str, out: Path, prefix: str) -> Sh
         try:
             open_storefront(page, product_url, password)
             try:
-                el = page.wait_for_selector(REBUILD_SELECTOR, timeout=30000)
-            except PlaywrightTimeout:  # charged: usually the section's own Liquid broke the render
-                raise RuntimeError("the rebuilt section did not render on the product page") from None
+                el = page.wait_for_selector(REBUILD_SELECTOR, timeout=20000)
+            except PlaywrightTimeout:  # a just-assigned template can take a moment to be served: reload once
+                page.reload(wait_until="domcontentloaded")
+                try:
+                    el = page.wait_for_selector(REBUILD_SELECTOR, timeout=20000)
+                except PlaywrightTimeout:  # charged: usually the section's own Liquid broke the render
+                    raise RuntimeError("the rebuilt section did not render on the product page") from None
             box = el.bounding_box()
             _settle(page, int(box["y"] + box["height"]))
             box = page.eval_on_selector(REBUILD_SELECTOR, "e => { const r = e.getBoundingClientRect(); "

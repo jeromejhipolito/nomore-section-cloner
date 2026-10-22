@@ -8,7 +8,7 @@ import time
 import httpx
 
 API_VERSION = "2026-01"
-JOB_POLLS = 30
+JOB_POLLS = 120  # seconds; Shopify's theme job queue can be slow
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
@@ -55,7 +55,9 @@ class Admin:
                 err = ShopifyTransientError if r.status_code >= 500 else ShopifyError
                 raise err(f"Admin API HTTP {r.status_code}: {r.text[:300]}")
             if body.get("errors"):
-                raise ShopifyError(f"GraphQL errors: {body['errors']}")
+                codes = {(e.get("extensions") or {}).get("code") for e in body["errors"]}
+                err = ShopifyTransientError if codes & {"INTERNAL_SERVER_ERROR", "TIMEOUT"} else ShopifyError
+                raise err(f"GraphQL errors: {body['errors']}")
             return body["data"]
         raise ShopifyTransientError("Admin API stayed throttled after 5 attempts")
 
@@ -88,7 +90,7 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
             return
         admin.sleep(1)
         job = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job["id"]})["job"]
-    raise ShopifyError(f"theme write job {job['id']} still not done after {JOB_POLLS}s")
+    raise ShopifyTransientError(f"theme write job {job['id']} still not done after {JOB_POLLS}s")
 
 
 def missing_scopes(admin: Admin, needed: set[str]) -> list[str]:

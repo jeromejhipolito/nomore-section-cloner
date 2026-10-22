@@ -41,13 +41,14 @@ source URL ──► scrape (Playwright, 390px iPhone viewport)
 
 The limits live in Python (`agent.py`), not in the prompt. Every successful compare snapshots the files it checked.
 However the session ends (an accepted `finish`, the $4.50 cap, the turn cap, an SDK error), the store is put back on
-that last compared version, uploaded in one call and read back. A half-failed write is never left live. Crashed calls
+that last compared version, uploaded in one call and read back, so a half-failed later write is not left live. (Before
+the first successful compare there is no such version to return to.) Crashed calls
 caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) don't use up a tool's attempts, up to 3.
 
 | Exit code | Meaning |
 |---|---|
 | `0` | done: `finish` accepted, and the store holds exactly the last written, read-back **and** compared version |
-| `1` | nothing was built, or the session ended without an accepted `finish` (the store is still put back) |
+| `1` | nothing was built, or the session ended without an accepted `finish` (the store is still put back if a compared version exists) |
 | `2` | usage/config error before the agent started (bad URL, missing `.env` key, token scopes) |
 | `3` | `finish` accepted, but the store could not be put back on the last compared version (the log says why) |
  The process exits `0` only after an accepted `finish`,

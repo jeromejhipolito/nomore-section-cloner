@@ -42,6 +42,7 @@ TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is 
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
+UPLOAD_WAIT_S = 180
 EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error (CLI) · 3 finished partial
 FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
@@ -115,7 +116,7 @@ class Run:
     rebuild_height: int | None = None  # from the latest compare
     good: dict[str, str] | None = None  # files of the last write that was read back AND compared
     finished: bool = False
-    partial: bool = False  # finish accepted, but the live files could not be put back to `good`
+    uploads: int = 0  # upload threads still running (a cancelled tool call can leave one behind)
     failures: int = 0  # tool calls that raised; the first FAILURE_CAP are not charged to a tool's budget
     cost: float | None = None  # set by the SDK's ResultMessage; None = the run ended before reporting it
     calls: Counter = field(default_factory=Counter)
@@ -167,12 +168,18 @@ def can_reach_current(run: "Run") -> bool:
 
 def is_transient(e: Exception) -> bool:
     """Infra trouble (network, Shopify 5xx/throttling, a browser that died) — not the agent's mistake."""
-    return isinstance(e, (OSError, httpx.TransportError, PlaywrightError, shopify.ShopifyTransientError))
+    return isinstance(e, (ConnectionError, TimeoutError, PlaywrightError, shopify.ShopifyTransientError))
 
 
 async def upload_verified(run: "Run", files: dict[str, str]) -> bool:
     """Upload section + template in ONE call, then read both back. True only if the store holds exactly `files`."""
-    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, files)
+    def upload():  # counted in the worker thread itself, so a cancelled caller can't hide a running upload
+        run.uploads += 1
+        try:
+            shopify.upsert_files(run.admin, run.theme_id, files)
+        finally:
+            run.uploads -= 1
+    await asyncio.to_thread(upload)
     back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
     try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
         same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
@@ -185,6 +192,10 @@ async def settle(run: "Run") -> None:
     """However the session ended, leave the store on the last compared version (`good`)."""
     if run.good is None or run.current():
         return
+    for _ in range(UPLOAD_WAIT_S):  # let an orphaned upload land first, or it could overwrite the restore
+        if run.uploads == 0:
+            break
+        await asyncio.sleep(1)
     try:
         ok = await upload_verified(run, run.good)
     except Exception as e:  # noqa: BLE001 - reported, and the exit code says partial/failed
@@ -383,6 +394,8 @@ async def run_agent(run: Run, model: str) -> int:
     prompt = f"Rebuild the first {run.sections} sections of this page as one Liquid section: {run.url}"
     try:
         await _converse(run, prompt, model)
+    except Exception as e:  # noqa: BLE001 - the SDK raises after a budget/turn-cap result; state decides the exit
+        run.log(f"session ended with {type(e).__name__}: {str(e)[:300]}")
     finally:  # budget cap, turn cap, SDK error or a normal finish: the store ends on the last compared version
         await settle(run)
     return exit_code(run)
@@ -414,7 +427,6 @@ def exit_code(run: Run) -> int:
     if run.done():
         return 0
     if run.finished and run.good is not None:
-        run.partial = True
         run.log(f"finished, but the live files are not the last compared version -> exit {EXIT_PARTIAL}")
         return EXIT_PARTIAL
     run.log("run ended without an accepted finish on a compared version -> exit 1")
