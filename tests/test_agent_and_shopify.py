@@ -197,3 +197,39 @@ def test_finish_still_refused_while_a_path_to_current_exists(tmp_path):
 def test_domain_normalisation_handles_http_and_trailing_slash():
     assert shopify.normalize_domain("http://s.myshopify.com/") == "s.myshopify.com"
     assert shopify.Admin("https://s.myshopify.com/", "t").domain == "s.myshopify.com"
+
+
+def test_finish_reachable_when_the_scrape_never_succeeds(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.calls["get_source"] = BUDGET["get_source"]  # every scrape failed, source is None
+    res = _call(tools["finish"], {"report": "could not read the source page"})
+    assert not res.get("is_error") and run.finished and run.partial
+
+
+def test_only_infra_crashes_are_forgiven(tmp_path):
+    from sectioncloner.agent import is_transient
+    assert is_transient(TimeoutError()) and is_transient(httpx.ConnectError("x"))
+    assert is_transient(shopify.ShopifyError("cannot reach s.myshopify.com: dns"))
+    assert is_transient(shopify.ShopifyError("Admin API HTTP 502: bad gateway"))
+    assert not is_transient(shopify.ShopifyError("files.0: Liquid syntax error"))  # the agent's own mistake
+    assert not is_transient(RuntimeError("rendered only 10px tall"))
+
+
+def test_partial_finish_restores_the_last_good_files_and_counts_as_done_if_it_was_compared(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    run, tools = _tools(tmp_path)
+    good = {agent.SECTION_FILE: "{{ x }}", agent.TEMPLATE_FILE: '{"order": []}'}
+    run.files, run.theme_id = good, "gid://shopify/OnlineStoreTheme/1"
+    run.mutations, run.written_at, run.compared_at = 3, 2, 2  # a write after the last compare failed half-way
+    run.calls["compare"] = BUDGET["compare"]
+    store = {}
+    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, files: store.update(files))
+    monkeypatch.setattr(shopify, "read_files", lambda a, t, names: {n: store[n] for n in names})
+    res = _call(tools["finish"], {"report": "x"})
+    assert not res.get("is_error") and store == good
+    assert run.done() and not run.partial  # live files == the last compared version again
+
+
+def test_exit_codes(tmp_path):
+    from sectioncloner.agent import EXIT_PARTIAL
+    assert EXIT_PARTIAL == 3  # distinct from the CLI's 2 (usage/config) and 1 (never finished)

@@ -28,6 +28,9 @@ from claude_agent_sdk import (
     tool,
 )
 
+import httpx
+from playwright.sync_api import Error as PlaywrightError
+
 from . import browser, lint, shopify
 
 SERVER = "builder"
@@ -39,6 +42,7 @@ TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is 
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
+EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error (CLI) · 3 finished partial
 FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
@@ -135,18 +139,53 @@ LAST_COMPARE_USED = ("all compares are used: a change now could never be checked
                      "compared; call finish and list what still differs")
 
 
-def can_reach_current(run: "Run") -> bool:
-    """Is there still a budget path to a written AND compared current state?"""
-    compares_left = run.calls["compare"] < BUDGET["compare"]
-    if run.written_at != run.mutations:  # needs a successful write, then a compare
-        writes_left = run.calls["write_files"] < BUDGET["write_files"] or (
-            bool(run.files) and run.calls["edit_file"] < BUDGET["edit_file"])
-        return writes_left and compares_left
-    return compares_left
-
-
+# The ONE place that says what the agent can still do. finish, the height gate and the write/edit refusals all
+# read these, so the budget rules cannot drift apart (iterations 2-5 of review kept finding such drift).
 def no_compares_left(run: "Run") -> bool:
     return run.calls["compare"] >= BUDGET["compare"]
+
+
+def can_still_write(run: "Run") -> bool:
+    """Could a write that gets compared afterwards still happen?"""
+    has_source = run.source is not None or run.calls["get_source"] < BUDGET["get_source"]
+    writes_left = run.calls["write_files"] < BUDGET["write_files"] or (
+        bool(run.files) and run.calls["edit_file"] < BUDGET["edit_file"])
+    return has_source and writes_left and not no_compares_left(run)
+
+
+def can_reach_current(run: "Run") -> bool:
+    """Is there still a budget path to a written AND compared current state?"""
+    if run.written_at != run.mutations:
+        return can_still_write(run)
+    return not no_compares_left(run)
+
+
+def is_transient(e: Exception) -> bool:
+    """Infra trouble (timeouts, network, Shopify 5xx/throttling, a browser that died) — not the agent's mistake."""
+    if isinstance(e, (TimeoutError, OSError, httpx.TransportError, PlaywrightError)):
+        return True
+    return isinstance(e, shopify.ShopifyError) and any(
+        k in str(e) for k in ("cannot reach", "HTTP 5", "throttled", "still not done"))
+
+
+async def restore_last_good(run: "Run") -> bool:
+    """Re-upload the last files that were written AND read back. True if the live theme now matches them."""
+    if not run.files or run.written_at is None or run.theme_id is None:
+        return False
+    try:
+        await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, {SECTION_FILE: run.files[SECTION_FILE]})
+        await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id,
+                                {TEMPLATE_FILE: run.files[TEMPLATE_FILE]})
+        back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
+        ok = (back.get(SECTION_FILE) == run.files[SECTION_FILE] and shopify.parse_template(
+            back.get(TEMPLATE_FILE, "null")) == json.loads(run.files[TEMPLATE_FILE]))
+    except Exception as e:  # noqa: BLE001 - restoring is best effort; the partial flag still tells the truth
+        run.log(f"restore of the last good files failed: {e}")
+        return False
+    if ok:
+        run.mutations = run.written_at  # the live files ARE that version again, verified by read-back
+        run.log("restored the last written + read-back files")
+    return ok
 
 
 def fmt_cost(cost: float | None) -> str:
@@ -171,7 +210,7 @@ def guarded(run: Run, name: str):
                     res = await fn(args)
                 except Exception as e:  # noqa: BLE001 - the agent must see every failure as a tool error
                     run.log(f"{name} failed: {e}")
-                    if run.failures < FAILURE_CAP:  # a crash (timeout, API error) is not a used attempt
+                    if is_transient(e) and run.failures < FAILURE_CAP:  # infra trouble is not a used attempt
                         run.failures += 1
                         run.calls[name] -= 1
                     return _err(f"{type(e).__name__}: {e}")
@@ -309,14 +348,17 @@ def build_tools(run: Run):
             if can_reach_current(run):
                 return _pre("the last change was not written successfully" if run.written_at != run.mutations
                             else "compare after your last change first")
-            # No budget left can make write + compare current again: accept, but as partial, never as done.
+            # No budget path back to a current state. First put the last read-back files live again, so a
+            # half-failed write never stays on the store; if that version was also compared, the run is done.
+            if await restore_last_good(run) and run.compared_at == run.mutations:
+                run.finished = True
+                run.log(f"finish accepted after restoring the last compared version: {args['report']}")
+                return _ok({"accepted": True, "restored_last_good": True})
             run.finished = run.partial = True
-            run.log(f"finish accepted as PARTIAL (live files not the last compared version): {args['report']}")
+            run.log(f"finish accepted as PARTIAL (live files are not the last compared version): {args['report']}")
             return _ok({"accepted": True, "partial": True})
         off = height_off(run)
-        can_change = run.calls["edit_file"] < BUDGET["edit_file"] or run.calls["write_files"] < BUDGET["write_files"]
-        if (off is not None and abs(off) > HEIGHT_TOLERANCE and can_change
-                and run.calls["compare"] < BUDGET["compare"]):
+        if off is not None and abs(off) > HEIGHT_TOLERANCE and can_still_write(run):
             return _pre(f"your section is {off:+.1%} the height of the original ({run.rebuild_height}px vs "
                         f"{run.source.shot.height}px); use a remaining compare to close the gap first")
         run.finished = True
@@ -362,5 +404,5 @@ async def run_agent(run: Run, model: str) -> int:
             run.log(f"session end: {msg.subtype}, turns={msg.num_turns}, API cost={fmt_cost(run.cost)}")
     if not run.done():
         run.log("run ended WITHOUT an accepted finish backed by a current write + compare -> exit "
-                + ("2 (partial finish)" if run.partial else "1"))
-    return 0 if run.done() else 2 if run.partial else 1
+                + (f"{EXIT_PARTIAL} (partial finish)" if run.partial else "1"))
+    return 0 if run.done() else EXIT_PARTIAL if run.partial else 1

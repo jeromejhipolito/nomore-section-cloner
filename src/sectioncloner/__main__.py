@@ -13,7 +13,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from . import shopify
-from .agent import Run, fmt_cost, run_agent
+from .agent import EXIT_PARTIAL, Run, fmt_cost, run_agent
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 
@@ -60,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         code = asyncio.run(run_agent(run, args.model))
     finally:  # the cost line is printed even if the run crashes
-        log(f"{'DONE' if code == 0 else 'FAILED'}: {run.product_url or '-'}  |  API cost {fmt_cost(run.cost)}"
+        status = {0: "DONE", EXIT_PARTIAL: "PARTIAL"}.get(code, "FAILED")
+        log(f"{status}: {run.product_url or '-'}  |  API cost {fmt_cost(run.cost)}"
             f"  |  artifacts {out}")
     return code
 

@@ -155,3 +155,13 @@ def test_odd_schema_shapes_are_refused_not_crashed():
     for schema in ['{"settings": [1]}', '{"settings": {}}', '{"blocks": [1]}', '{"blocks": [{"settings": [2]}]}']:
         assert lint.check_section("{% schema %}" + schema + "{% endschema %}") == \
             ["schema: settings/blocks must be lists of objects"], schema
+
+
+def test_copy_spelled_as_css_escapes_is_still_copy():
+    assert any("CSS content" in p for p in lint.check_section(CLEAN.replace('content: "";', r'content: "\42 \75 \79";')))
+    assert lint.check_section(CLEAN.replace('content: "";', r'content: "\2713";')) == []
+
+
+def test_non_string_setting_ids_are_refused_cleanly():
+    assert lint.check_section('{% schema %}{"settings": [{"id": [1]}]}{% endschema %}') == \
+        ["schema: every setting id must be a string"]

@@ -29,6 +29,12 @@ VISIBLE_VALUE_TYPES = {"submit", "button", "reset", "text", "email", "search", "
 # Literal arguments that are markup, not copy: `image_tag: sizes: '(min-width: 750px) 50vw'`, `date: '%b %d'`, …
 NON_COPY_ARG = re.compile(r"\b(sizes|date|class|id|format|font_display|loading|widths|media|rel|target)\s*:\s*$")
 CSS_ESCAPE = re.compile(r"\\[0-9a-fA-F]{1,6}\s?")
+def decode_css_escapes(s: str) -> str:
+    """'\\42\\75\\79' -> 'Buy', so copy spelled as escapes is still copy; '\\2713' -> '✓' stays a symbol."""
+    return CSS_ESCAPE.sub(lambda m: chr(int(m.group(0).strip()[1:], 16)) if int(m.group(0).strip()[1:], 16) <= 0x10FFFF
+                          else "", s)
+
+
 CSS_CONTENT = re.compile(r"content\s*:\s*(['\"])(.*?)\1", re.S)
 
 
@@ -86,7 +92,7 @@ def check_section(liquid: str) -> list[str]:
         if CSS_REMOTE_URL.search(css):
             problems.append("remote url(...) in CSS (put the image in a setting)")
         problems += [f"hardcoded text in CSS content: {c.group(2)[:60]!r}" for c in CSS_CONTENT.finditer(css)
-                     if re.search(r"[A-Za-z0-9]", CSS_ESCAPE.sub("", c.group(2)))]  # "\2713" is an icon
+                     if re.search(r"[A-Za-z0-9]", decode_css_escapes(c.group(2)))]  # "\2713" ✓ is an icon
     c = _Collector()
     c.feed(LIQUID.sub(MARK, CODE_BLOCKS.sub("", markup)))
     problems += c.problems
@@ -103,6 +109,10 @@ def _check_schema(schema: dict) -> list[str]:
                                                  for b in blocks)):
         return ["schema: settings/blocks must be lists of objects"]
     problems, seen = [], set()
+    ids = [s["id"] for s in settings if "id" in s] + [
+        x["id"] for b in blocks for x in b.get("settings", []) if "id" in x]
+    if not all(isinstance(i, str) for i in ids):
+        return ["schema: every setting id must be a string"]
     for s in settings:
         if "id" in s and s["id"] in seen:
             problems.append(f"duplicate setting id {s['id']}")

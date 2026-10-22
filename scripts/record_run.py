@@ -60,7 +60,7 @@ es.onmessage = e => { const d = JSON.parse(e.data);
 def classify(line: str) -> str:
     if "] -> " in line:
         return "tool"
-    if "<- ERROR" in line or "Error" in line or "FAILED" in line:
+    if "<- ERROR" in line or "Error" in line or "FAILED" in line or "PARTIAL" in line:
         return "err"
     if "API cost" in line or "session end" in line:
         return "cost"
