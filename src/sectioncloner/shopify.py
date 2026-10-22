@@ -20,6 +20,10 @@ class ShopifyError(RuntimeError):
     pass
 
 
+class ShopifyTransientError(ShopifyError):
+    """Infra trouble worth a free retry: unreachable, 5xx, still throttled. Never the caller's own mistake."""
+
+
 class Admin:
     def __init__(self, domain: str, token: str, client: httpx.Client | None = None, sleep=time.sleep):
         self.domain = normalize_domain(domain)
@@ -38,9 +42,9 @@ class Admin:
                 if attempt < 4:
                     self.sleep(min(2**attempt, 20))
                     continue
-                raise ShopifyError(f"cannot reach {self.domain}: {e}") from e
+                raise ShopifyTransientError(f"cannot reach {self.domain}: {e}") from e
             except ValueError as e:  # a 200 that isn't JSON (an HTML interstitial)
-                raise ShopifyError(f"Admin API returned non-JSON: {r.text[:200]}") from e
+                raise ShopifyTransientError(f"Admin API returned non-JSON: {r.text[:200]}") from e
             throttled = body is not None and any(
                 (e.get("extensions") or {}).get("code") == "THROTTLED" for e in body.get("errors") or [])
             if r.status_code == 429 or throttled:
@@ -48,11 +52,12 @@ class Admin:
                     self.sleep(min(2**attempt, 20))
                 continue
             if r.status_code != 200:
-                raise ShopifyError(f"Admin API HTTP {r.status_code}: {r.text[:300]}")
+                err = ShopifyTransientError if r.status_code >= 500 else ShopifyError
+                raise err(f"Admin API HTTP {r.status_code}: {r.text[:300]}")
             if body.get("errors"):
                 raise ShopifyError(f"GraphQL errors: {body['errors']}")
             return body["data"]
-        raise ShopifyError("Admin API stayed throttled after 5 attempts")
+        raise ShopifyTransientError("Admin API stayed throttled after 5 attempts")
 
 
 def _raise_user_errors(errs: list[dict]) -> None:

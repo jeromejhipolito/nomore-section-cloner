@@ -113,15 +113,20 @@ class Run:
     written_at: int | None = None  # mutations value when the last write was read back and matched
     compared_at: int | None = None
     rebuild_height: int | None = None  # from the latest compare
+    good: dict[str, str] | None = None  # files of the last write that was read back AND compared
     finished: bool = False
-    partial: bool = False  # finish accepted although the live files are not the last compared ones
+    partial: bool = False  # finish accepted, but the live files could not be put back to `good`
     failures: int = 0  # tool calls that raised; the first FAILURE_CAP are not charged to a tool's budget
     cost: float | None = None  # set by the SDK's ResultMessage; None = the run ended before reporting it
     calls: Counter = field(default_factory=Counter)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    def current(self) -> bool:
+        """Live files == the last written, read-back AND compared version."""
+        return self.good is not None and self.written_at == self.mutations == self.compared_at
+
     def done(self) -> bool:
-        return self.finished and self.written_at == self.mutations == self.compared_at
+        return self.finished and self.current()
 
 
 def _ok(data, images: list[Path] = ()) -> dict:
@@ -161,31 +166,36 @@ def can_reach_current(run: "Run") -> bool:
 
 
 def is_transient(e: Exception) -> bool:
-    """Infra trouble (timeouts, network, Shopify 5xx/throttling, a browser that died) — not the agent's mistake."""
-    if isinstance(e, (TimeoutError, OSError, httpx.TransportError, PlaywrightError)):
-        return True
-    return isinstance(e, shopify.ShopifyError) and any(
-        k in str(e) for k in ("cannot reach", "HTTP 5", "throttled", "still not done"))
+    """Infra trouble (network, Shopify 5xx/throttling, a browser that died) — not the agent's mistake."""
+    return isinstance(e, (OSError, httpx.TransportError, PlaywrightError, shopify.ShopifyTransientError))
 
 
-async def restore_last_good(run: "Run") -> bool:
-    """Re-upload the last files that were written AND read back. True if the live theme now matches them."""
-    if not run.files or run.written_at is None or run.theme_id is None:
-        return False
+async def upload_verified(run: "Run", files: dict[str, str]) -> bool:
+    """Upload section + template in ONE call, then read both back. True only if the store holds exactly `files`."""
+    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, files)
+    back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
+    try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
+        same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
+    except (json.JSONDecodeError, ValueError):
+        same_template = False
+    return back.get(SECTION_FILE) == files[SECTION_FILE] and same_template
+
+
+async def settle(run: "Run") -> None:
+    """However the session ended, leave the store on the last compared version (`good`)."""
+    if run.good is None or run.current():
+        return
     try:
-        await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, {SECTION_FILE: run.files[SECTION_FILE]})
-        await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id,
-                                {TEMPLATE_FILE: run.files[TEMPLATE_FILE]})
-        back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
-        ok = (back.get(SECTION_FILE) == run.files[SECTION_FILE] and shopify.parse_template(
-            back.get(TEMPLATE_FILE, "null")) == json.loads(run.files[TEMPLATE_FILE]))
-    except Exception as e:  # noqa: BLE001 - restoring is best effort; the partial flag still tells the truth
-        run.log(f"restore of the last good files failed: {e}")
-        return False
+        ok = await upload_verified(run, run.good)
+    except Exception as e:  # noqa: BLE001 - reported, and the exit code says partial/failed
+        run.log(f"could not put the last compared version back live: {e}")
+        return
     if ok:
-        run.mutations = run.written_at  # the live files ARE that version again, verified by read-back
-        run.log("restored the last written + read-back files")
-    return ok
+        run.mutations += 1
+        run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations  # identical content
+        run.log("put the last compared version back live (read back and verified)")
+    else:
+        run.log("putting the last compared version back live did not read back identically")
 
 
 def fmt_cost(cost: float | None) -> str:
@@ -263,18 +273,8 @@ async def _write(run: Run, files: dict[str, str]) -> dict:
     if run.theme_id is None:
         run.theme_id = await asyncio.to_thread(shopify.main_theme_id, run.admin)
     run.mutations += 1  # before the write: a partial failure must invalidate the last verify
-    # Section first: the template references it, and Shopify validates the reference.
-    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, {SECTION_FILE: files[SECTION_FILE]})
-    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, {TEMPLATE_FILE: files[TEMPLATE_FILE]})
-    back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
-    if back.get(SECTION_FILE) != files[SECTION_FILE]:
-        return _err("read-back of the section differs from what was written")
-    try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
-        same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
-    except (json.JSONDecodeError, ValueError):
-        same_template = False
-    if not same_template:
-        return _err("read-back of the template differs from what was written")
+    if not await upload_verified(run, files):
+        return _err("read-back differs from what was written")
     if run.product_url is None:  # before marking the write done: compare needs a product page to open
         await asyncio.to_thread(shopify.ensure_product, run.admin, PRODUCT_HANDLE, PRODUCT_TITLE, PRODUCT_PRICE,
                                 TEMPLATE_SUFFIX)
@@ -318,7 +318,7 @@ def build_tools(run: Run):
             return _pre(LAST_COMPARE_USED)
         name = {"section": SECTION_FILE, "template": TEMPLATE_FILE}.get(args["file"])
         if name is None:
-            return _err("file must be 'section' or 'template'")
+            return _pre("file must be 'section' or 'template'")
         n = run.files[name].count(args["old"])
         if n != 1:
             return _err(f"'old' must match exactly once in {name}; it matched {n} times")
@@ -335,6 +335,7 @@ def build_tools(run: Run):
         shot = await asyncio.to_thread(browser.shoot_rebuild, url, run.password, run.out, f"rebuild{i}")
         pairs = await asyncio.to_thread(browser.side_by_side, run.source.shot, shot, run.out, f"cmp{i}")
         run.compared_at = run.mutations
+        run.good = run.files  # the version settle() falls back to, however the session ends
         run.rebuild_height = shot.height
         left = BUDGET["compare"] - i
         run.log(f"compare #{i}: source {run.source.shot.height}px vs rebuild {shot.height}px, {left} left")
@@ -344,19 +345,15 @@ def build_tools(run: Run):
     @tool("finish", "End the run with a short report.", {"report": str})
     @guarded(run, "finish")
     async def finish(args):
-        if run.written_at != run.mutations or run.compared_at != run.mutations:
+        if not run.current():
             if can_reach_current(run):
-                return _pre("the last change was not written successfully" if run.written_at != run.mutations
+                return _pre("nothing written yet: start with get_source, then write_files" if run.written_at is None
+                            else "the last change was not written successfully" if run.written_at != run.mutations
                             else "compare after your last change first")
-            # No budget path back to a current state. First put the last read-back files live again, so a
-            # half-failed write never stays on the store; if that version was also compared, the run is done.
-            if await restore_last_good(run) and run.compared_at == run.mutations:
-                run.finished = True
-                run.log(f"finish accepted after restoring the last compared version: {args['report']}")
-                return _ok({"accepted": True, "restored_last_good": True})
-            run.finished = run.partial = True
-            run.log(f"finish accepted as PARTIAL (live files are not the last compared version): {args['report']}")
-            return _ok({"accepted": True, "partial": True})
+            # No budget path back to a current state: accept; settle() then puts the last compared version live.
+            run.finished = True
+            run.log(f"finish accepted; the last compared version will be put back live: {args['report']}")
+            return _ok({"accepted": True, "restoring_last_compared_version": run.good is not None})
         off = height_off(run)
         if off is not None and abs(off) > HEIGHT_TOLERANCE and can_still_write(run):
             return _pre(f"your section is {off:+.1%} the height of the original ({run.rebuild_height}px vs "
@@ -384,6 +381,14 @@ def options_for(run: Run, model: str) -> ClaudeAgentOptions:
 
 async def run_agent(run: Run, model: str) -> int:
     prompt = f"Rebuild the first {run.sections} sections of this page as one Liquid section: {run.url}"
+    try:
+        await _converse(run, prompt, model)
+    finally:  # budget cap, turn cap, SDK error or a normal finish: the store ends on the last compared version
+        await settle(run)
+    return exit_code(run)
+
+
+async def _converse(run: Run, prompt: str, model: str) -> None:
     async for msg in query(prompt=prompt, options=options_for(run, model)):
         if isinstance(msg, AssistantMessage):
             for b in msg.content:
@@ -402,7 +407,15 @@ async def run_agent(run: Run, model: str) -> int:
         elif isinstance(msg, ResultMessage):
             run.cost = msg.total_cost_usd
             run.log(f"session end: {msg.subtype}, turns={msg.num_turns}, API cost={fmt_cost(run.cost)}")
-    if not run.done():
-        run.log("run ended WITHOUT an accepted finish backed by a current write + compare -> exit "
-                + (f"{EXIT_PARTIAL} (partial finish)" if run.partial else "1"))
-    return 0 if run.done() else EXIT_PARTIAL if run.partial else 1
+
+
+def exit_code(run: Run) -> int:
+    """0 done · 1 nothing built or never finished · 3 finished but the store is not on the last compared version."""
+    if run.done():
+        return 0
+    if run.finished and run.good is not None:
+        run.partial = True
+        run.log(f"finished, but the live files are not the last compared version -> exit {EXIT_PARTIAL}")
+        return EXIT_PARTIAL
+    run.log("run ended without an accepted finish on a compared version -> exit 1")
+    return 1

@@ -39,16 +39,17 @@ source URL ──► scrape (Playwright, 390px iPhone viewport)
 | `compare` | screenshots the rebuilt section on the storefront; returns original \| rebuild side by side per band | **4 calls = the visual iteration cap** |
 | `finish` | accepted only if the latest change was written **and** compared | 3 calls |
 
-The limits live in Python (`agent.py`), not in the prompt. One helper decides what the agent can still do, so
-`finish` is always reachable: a crashed call (timeout, network, Shopify 5xx) is not charged, up to 3 crashes, and when no
-budget can make the live files the last compared version again, `finish` first restores the last read-back files.
+The limits live in Python (`agent.py`), not in the prompt. Every successful compare snapshots the files it checked.
+However the session ends (an accepted `finish`, the $4.50 cap, the turn cap, an SDK error), the store is put back on
+that last compared version, uploaded in one call and read back. A half-failed write is never left live. Crashed calls
+caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) don't use up a tool's attempts, up to 3.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | done: the live files are exactly the last written, read-back **and** compared version |
-| `1` | the session ended without an accepted `finish` |
+| `0` | done: `finish` accepted, and the store holds exactly the last written, read-back **and** compared version |
+| `1` | nothing was built, or the session ended without an accepted `finish` (the store is still put back) |
 | `2` | usage/config error before the agent started (bad URL, missing `.env` key, token scopes) |
-| `3` | finished **partial**: the live files are not the last compared version (the log says why) |
+| `3` | `finish` accepted, but the store could not be put back on the last compared version (the log says why) |
  The process exits `0` only after an accepted `finish`,
 and always prints the run's **API cost** (`ResultMessage.total_cost_usd`).
 

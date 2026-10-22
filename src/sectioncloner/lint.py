@@ -31,11 +31,14 @@ NON_COPY_ARG = re.compile(r"\b(sizes|date|class|id|format|font_display|loading|w
 CSS_ESCAPE = re.compile(r"\\[0-9a-fA-F]{1,6}\s?")
 def decode_css_escapes(s: str) -> str:
     """'\\42\\75\\79' -> 'Buy', so copy spelled as escapes is still copy; '\\2713' -> '✓' stays a symbol."""
-    return CSS_ESCAPE.sub(lambda m: chr(int(m.group(0).strip()[1:], 16)) if int(m.group(0).strip()[1:], 16) <= 0x10FFFF
-                          else "", s)
+    def char(m):
+        code = int(m.group(0).strip()[1:], 16)
+        return chr(code) if code <= 0x10FFFF else ""
+    return CSS_ESCAPE.sub(char, s)
 
 
-CSS_CONTENT = re.compile(r"content\s*:\s*(['\"])(.*?)\1", re.S)
+CSS_CONTENT = re.compile(r"(?<![\w-])content\s*:\s*([^;}]*)")  # the whole value: "a" "b", attr(x), …
+CSS_STRING = re.compile(r"(['\"])(.*?)\1", re.S)
 
 
 class _Collector(HTMLParser):
@@ -91,8 +94,12 @@ def check_section(liquid: str) -> list[str]:
         css = LIQUID.sub("", m.group(2) or m.group(3) or "")
         if CSS_REMOTE_URL.search(css):
             problems.append("remote url(...) in CSS (put the image in a setting)")
-        problems += [f"hardcoded text in CSS content: {c.group(2)[:60]!r}" for c in CSS_CONTENT.finditer(css)
-                     if re.search(r"[A-Za-z0-9]", decode_css_escapes(c.group(2)))]  # "\2713" ✓ is an icon
+        for decl in CSS_CONTENT.finditer(css):
+            value = decl.group(1)
+            if "attr(" in value:  # the copy lives in a markup attribute the editor can't reach
+                problems.append(f"CSS content uses attr(): {value.strip()[:60]!r}")
+            problems += [f"hardcoded text in CSS content: {m.group(2)[:60]!r}" for m in CSS_STRING.finditer(value)
+                         if re.search(r"[A-Za-z0-9]", decode_css_escapes(m.group(2)))]  # "\2713" ✓ is an icon
     c = _Collector()
     c.feed(LIQUID.sub(MARK, CODE_BLOCKS.sub("", markup)))
     problems += c.problems

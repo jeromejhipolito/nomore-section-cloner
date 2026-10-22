@@ -165,3 +165,9 @@ def test_copy_spelled_as_css_escapes_is_still_copy():
 def test_non_string_setting_ids_are_refused_cleanly():
     assert lint.check_section('{% schema %}{"settings": [{"id": [1]}]}{% endschema %}') == \
         ["schema: every setting id must be a string"]
+
+
+def test_every_string_and_attr_in_css_content_is_checked():
+    assert any("CSS content" in p for p in lint.check_section(CLEAN.replace('content: "";', 'content: "" "Buy now";')))
+    assert any("attr()" in p for p in lint.check_section(CLEAN.replace('content: "";', "content: attr(data-label);")))
+    assert lint.check_section(CLEAN.replace('content: "";', 'content: "" "\\2713";')) == []

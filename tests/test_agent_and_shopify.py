@@ -37,7 +37,7 @@ def test_finish_needs_a_compare_after_the_last_write(tmp_path):
     run, tools = _tools(tmp_path)
     run.mutations = run.written_at = 2
     run.product_url = "https://x.myshopify.com/products/p"
-    run.compared_at = 1  # compared an older version
+    run.compared_at, run.good = 1, {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}  # compared an older version
     assert _call(tools["finish"], {"report": "x"}).get("is_error")
     run.compared_at = 2
     assert not _call(tools["finish"], {"report": "x"}).get("is_error")
@@ -100,7 +100,7 @@ def test_finish_allowed_when_height_is_close(tmp_path):
     run, tools = _tools(tmp_path)
     run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=2714))
     run.mutations = run.written_at = run.compared_at = 1
-    run.product_url = "https://x.myshopify.com/products/p"
+    run.product_url, run.good = "https://x.myshopify.com/products/p", {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}
     run.rebuild_height, run.calls["compare"] = 2715, 1
     assert not _call(tools["finish"], {"report": "x"}).get("is_error")
 
@@ -109,7 +109,7 @@ def test_finish_allowed_when_nothing_can_change_anymore(tmp_path):
     run, tools = _tools(tmp_path)
     run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=2714))
     run.mutations = run.written_at = run.compared_at = 1
-    run.product_url = "https://x.myshopify.com/products/p"
+    run.product_url, run.good = "https://x.myshopify.com/products/p", {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}
     run.rebuild_height, run.calls["compare"] = 2627, 2
     run.calls["edit_file"], run.calls["write_files"] = BUDGET["edit_file"], BUDGET["write_files"]
     assert not _call(tools["finish"], {"report": "x"}).get("is_error")  # no deadlock: the gap goes in the report
@@ -178,13 +178,17 @@ def test_a_crashing_compare_is_not_charged_until_the_failure_cap(tmp_path, monke
     assert run.calls["compare"] == 1
 
 
-def test_finish_is_partial_when_no_budget_path_can_make_the_state_current(tmp_path):
+def test_finish_accepted_when_no_budget_path_remains_then_settle_decides_the_exit(tmp_path, monkeypatch):
+    from sectioncloner import agent
     run, tools = _tools(tmp_path)
     run.mutations, run.written_at, run.compared_at = 3, 2, 2  # last write failed after the last compare
-    run.files = {"sections/nomore-landing.liquid": "a"}
+    run.files = run.good = {"sections/nomore-landing.liquid": "a", "templates/product.nomore.json": "{}"}
+    run.theme_id = "gid://shopify/OnlineStoreTheme/1"
     run.calls["compare"] = BUDGET["compare"]  # and every compare is used
-    res = _call(tools["finish"], {"report": "x"})
-    assert not res.get("is_error") and run.finished and run.partial and not run.done()
+    assert not _call(tools["finish"], {"report": "x"}).get("is_error") and run.finished
+    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, f: (_ for _ in ()).throw(shopify.ShopifyError("no")))
+    asyncio.run(agent.settle(run))
+    assert agent.exit_code(run) == agent.EXIT_PARTIAL and run.partial  # could not put it back: partial
 
 
 def test_finish_still_refused_while_a_path_to_current_exists(tmp_path):
@@ -200,34 +204,38 @@ def test_domain_normalisation_handles_http_and_trailing_slash():
 
 
 def test_finish_reachable_when_the_scrape_never_succeeds(tmp_path):
-    run, tools = _tools(tmp_path)
-    run.calls["get_source"] = BUDGET["get_source"]  # every scrape failed, source is None
-    res = _call(tools["finish"], {"report": "could not read the source page"})
-    assert not res.get("is_error") and run.finished and run.partial
-
-
-def test_only_infra_crashes_are_forgiven(tmp_path):
-    from sectioncloner.agent import is_transient
-    assert is_transient(TimeoutError()) and is_transient(httpx.ConnectError("x"))
-    assert is_transient(shopify.ShopifyError("cannot reach s.myshopify.com: dns"))
-    assert is_transient(shopify.ShopifyError("Admin API HTTP 502: bad gateway"))
-    assert not is_transient(shopify.ShopifyError("files.0: Liquid syntax error"))  # the agent's own mistake
-    assert not is_transient(RuntimeError("rendered only 10px tall"))
-
-
-def test_partial_finish_restores_the_last_good_files_and_counts_as_done_if_it_was_compared(tmp_path, monkeypatch):
     from sectioncloner import agent
     run, tools = _tools(tmp_path)
+    run.calls["get_source"] = BUDGET["get_source"]  # every scrape failed, source is None
+    assert not _call(tools["finish"], {"report": "could not read the source page"}).get("is_error")
+    assert agent.exit_code(run) == 1  # nothing was built: not a "partial", a failure
+
+
+def test_only_infra_crashes_are_forgiven():
+    from sectioncloner.agent import is_transient
+    assert is_transient(TimeoutError()) and is_transient(httpx.ConnectError("x"))
+    assert is_transient(shopify.ShopifyTransientError("Admin API HTTP 502: bad gateway"))
+    assert not is_transient(shopify.ShopifyError("files.0: Liquid syntax error"))  # the agent's own mistake
+    assert not is_transient(shopify.ShopifyError("throttled"))  # typed, not matched on message text
+    assert not is_transient(RuntimeError("the rebuilt section did not render on the product page"))
+
+
+def test_settle_puts_the_last_compared_version_back_however_the_session_ended(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    run, _ = _tools(tmp_path)
     good = {agent.SECTION_FILE: "{{ x }}", agent.TEMPLATE_FILE: '{"order": []}'}
-    run.files, run.theme_id = good, "gid://shopify/OnlineStoreTheme/1"
-    run.mutations, run.written_at, run.compared_at = 3, 2, 2  # a write after the last compare failed half-way
-    run.calls["compare"] = BUDGET["compare"]
+    run.good, run.theme_id = good, "gid://shopify/OnlineStoreTheme/1"
+    run.files = {agent.SECTION_FILE: "new", agent.TEMPLATE_FILE: '{"order": [1]}'}
+    run.mutations, run.written_at, run.compared_at = 3, 2, 2  # half-failed write, session then hit its budget
     store = {}
-    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, files: store.update(files))
+    calls = []
+    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, files: (calls.append(sorted(files)), store.update(files)))
     monkeypatch.setattr(shopify, "read_files", lambda a, t, names: {n: store[n] for n in names})
-    res = _call(tools["finish"], {"report": "x"})
-    assert not res.get("is_error") and store == good
-    assert run.done() and not run.partial  # live files == the last compared version again
+    asyncio.run(agent.settle(run))
+    assert store == good and calls == [sorted(good)]  # both files in ONE upload
+    assert run.current() and agent.exit_code(run) == 1  # store is safe, but the session never finished
+    run.finished = True
+    assert agent.exit_code(run) == 0
 
 
 def test_exit_codes(tmp_path):
