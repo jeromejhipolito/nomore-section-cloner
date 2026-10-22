@@ -13,13 +13,16 @@ from playwright.sync_api import Page, sync_playwright
 
 from .agent import PRODUCT_HANDLE
 from .browser import HEIGHT, REBUILD_SELECTOR, UA, WIDTH, open_storefront
+from .shopify import normalize_domain
 
 PHONE = {"viewport": {"width": WIDTH, "height": HEIGHT}, "user_agent": UA, "is_mobile": True, "has_touch": True}
 
 
 def product_url() -> str:
-    domain = os.environ["SHOPIFY_STORE_DOMAIN"].removeprefix("https://").strip("/")  # same as shopify.Admin
-    return f"https://{domain}/products/{PRODUCT_HANDLE}"
+    domain = os.getenv("SHOPIFY_STORE_DOMAIN")
+    if not domain:
+        raise SystemExit("SHOPIFY_STORE_DOMAIN is not set (.env)")
+    return f"https://{normalize_domain(domain)}/products/{PRODUCT_HANDLE}"
 
 
 def tour(page: Page, url: str, password: str, hold: float = 6) -> None:

@@ -28,6 +28,7 @@ MARK = "⁣"  # stands in for a Liquid tag/output, so `alt="{{ x }}"` isn't a li
 VISIBLE_VALUE_TYPES = {"submit", "button", "reset", "text", "email", "search", "tel", "url"}
 # Literal arguments that are markup, not copy: `image_tag: sizes: '(min-width: 750px) 50vw'`, `date: '%b %d'`, …
 NON_COPY_ARG = re.compile(r"\b(sizes|date|class|id|format|font_display|loading|widths|media|rel|target)\s*:\s*$")
+CSS_ESCAPE = re.compile(r"\\[0-9a-fA-F]{1,6}\s?")
 CSS_CONTENT = re.compile(r"content\s*:\s*(['\"])(.*?)\1", re.S)
 
 
@@ -75,7 +76,9 @@ def check_section(liquid: str) -> list[str]:
             lit = m.group(1) if m.group(1) is not None else m.group(2)
             translated = re.match(r"\s*\|\s*t\b", tag.group(0)[m.end():])
             markup_arg = NON_COPY_ARG.search(tag.group(0)[:m.start()]) or re.match(r"{%-?\s*form\b", tag.group(0))
-            if (re.search(r"[A-Za-z]", lit) and (" " in lit or lit.lstrip()[:1].isupper())
+            if LITERAL_URL.search(lit):  # {{ 'https://…/x.jpg' }} is a hardcoded image/link, not a key
+                problems.append(f"literal URL in a Liquid string: {lit[:60]!r}")
+            elif (re.search(r"[A-Za-z]", lit) and (" " in lit or lit.lstrip()[:1].isupper())
                     and not translated and not markup_arg):
                 problems.append(f"hardcoded text in a Liquid string: {lit[:60]!r}")
     for m in STYLE_BLOCKS.finditer(markup):
@@ -83,7 +86,7 @@ def check_section(liquid: str) -> list[str]:
         if CSS_REMOTE_URL.search(css):
             problems.append("remote url(...) in CSS (put the image in a setting)")
         problems += [f"hardcoded text in CSS content: {c.group(2)[:60]!r}" for c in CSS_CONTENT.finditer(css)
-                     if re.search(r"[A-Za-z0-9]", c.group(2))]
+                     if re.search(r"[A-Za-z0-9]", CSS_ESCAPE.sub("", c.group(2)))]  # "\2713" is an icon
     c = _Collector()
     c.feed(LIQUID.sub(MARK, CODE_BLOCKS.sub("", markup)))
     problems += c.problems
@@ -93,12 +96,18 @@ def check_section(liquid: str) -> list[str]:
 
 
 def _check_schema(schema: dict) -> list[str]:
+    settings, blocks = schema.get("settings", []), schema.get("blocks", [])
+    if not (isinstance(settings, list) and all(isinstance(x, dict) for x in settings)
+            and isinstance(blocks, list) and all(isinstance(b, dict) and isinstance(b.get("settings", []), list)
+                                                 and all(isinstance(x, dict) for x in b.get("settings", []))
+                                                 for b in blocks)):
+        return ["schema: settings/blocks must be lists of objects"]
     problems, seen = [], set()
-    for s in schema.get("settings", []):
+    for s in settings:
         if "id" in s and s["id"] in seen:
             problems.append(f"duplicate setting id {s['id']}")
         seen.add(s.get("id"))
-    for b in schema.get("blocks", []):
+    for b in blocks:
         ids = [s.get("id") for s in b.get("settings", []) if "id" in s]
         if len(ids) != len(set(ids)):
             problems.append(f"duplicate setting id in block {b.get('type')}")

@@ -159,3 +159,41 @@ def test_network_errors_become_a_clean_shopify_error():
         assert "cannot reach nope.myshopify.com" in str(e)
     else:
         raise AssertionError("expected ShopifyError")
+
+
+def test_a_crashing_compare_is_not_charged_until_the_failure_cap(tmp_path, monkeypatch):
+    from sectioncloner import agent, browser
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=10))
+    run.mutations = run.written_at = 1
+    run.product_url = "https://x.myshopify.com/products/p"
+
+    def boom(*a, **k):
+        raise TimeoutError("storefront timed out")
+    monkeypatch.setattr(browser, "shoot_rebuild", boom)
+    for _ in range(agent.FAILURE_CAP):
+        assert _call(tools["compare"]).get("is_error")
+    assert run.calls["compare"] == 0 and run.failures == agent.FAILURE_CAP
+    _call(tools["compare"])  # past the cap, crashes cost budget again (no infinite retry loop)
+    assert run.calls["compare"] == 1
+
+
+def test_finish_is_partial_when_no_budget_path_can_make_the_state_current(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.mutations, run.written_at, run.compared_at = 3, 2, 2  # last write failed after the last compare
+    run.files = {"sections/nomore-landing.liquid": "a"}
+    run.calls["compare"] = BUDGET["compare"]  # and every compare is used
+    res = _call(tools["finish"], {"report": "x"})
+    assert not res.get("is_error") and run.finished and run.partial and not run.done()
+
+
+def test_finish_still_refused_while_a_path_to_current_exists(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.mutations, run.written_at, run.compared_at = 3, 3, 2
+    run.calls["compare"] = 2  # a compare is still available
+    assert _call(tools["finish"], {"report": "x"}).get("is_error") and not run.finished
+
+
+def test_domain_normalisation_handles_http_and_trailing_slash():
+    assert shopify.normalize_domain("http://s.myshopify.com/") == "s.myshopify.com"
+    assert shopify.Admin("https://s.myshopify.com/", "t").domain == "s.myshopify.com"

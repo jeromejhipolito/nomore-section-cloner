@@ -139,3 +139,19 @@ def test_text_input_value_is_copy_and_odd_shapes_are_refused_cleanly():
     assert lint.check_template("[]", SECTION_TYPE, TEMPLATE_KEY)
     assert lint.check_template(json.dumps({"sections": {TEMPLATE_KEY: "x"}}), SECTION_TYPE, TEMPLATE_KEY)
     assert lint.check_section("{% schema %}[]{% endschema %}") == ["schema: must be a JSON object"]
+
+
+def test_url_inside_a_liquid_string_is_hardcoded():
+    bad = CLEAN.replace('src="{{ block.settings.image_url }}"', "src=\"{{ 'https://cdn.shopify.com/s/files/x.jpg' }}\"")
+    assert any("literal URL in a Liquid string" in p for p in lint.check_section(bad))
+
+
+def test_css_escape_icons_are_allowed_in_content():
+    assert lint.check_section(CLEAN.replace('content: "";', 'content: "\\2713";')) == []
+    assert any("CSS content" in p for p in lint.check_section(CLEAN.replace('content: "";', 'content: "\\2713 Yes";')))
+
+
+def test_odd_schema_shapes_are_refused_not_crashed():
+    for schema in ['{"settings": [1]}', '{"settings": {}}', '{"blocks": [1]}', '{"blocks": [{"settings": [2]}]}']:
+        assert lint.check_section("{% schema %}" + schema + "{% endschema %}") == \
+            ["schema: settings/blocks must be lists of objects"], schema

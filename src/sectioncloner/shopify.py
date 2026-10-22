@@ -12,13 +12,17 @@ JOB_POLLS = 30
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
+def normalize_domain(domain: str) -> str:
+    return domain.removeprefix("https://").removeprefix("http://").strip("/")
+
+
 class ShopifyError(RuntimeError):
     pass
 
 
 class Admin:
     def __init__(self, domain: str, token: str, client: httpx.Client | None = None, sleep=time.sleep):
-        self.domain = domain.removeprefix("https://").strip("/")
+        self.domain = normalize_domain(domain)
         self.url = f"https://{self.domain}/admin/api/{API_VERSION}/graphql.json"
         self.http = client or httpx.Client(timeout=60)
         self.headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -40,7 +44,8 @@ class Admin:
             throttled = body is not None and any(
                 (e.get("extensions") or {}).get("code") == "THROTTLED" for e in body.get("errors") or [])
             if r.status_code == 429 or throttled:
-                self.sleep(min(2**attempt, 20))
+                if attempt < 4:  # no pointless sleep before giving up
+                    self.sleep(min(2**attempt, 20))
                 continue
             if r.status_code != 200:
                 raise ShopifyError(f"Admin API HTTP {r.status_code}: {r.text[:300]}")

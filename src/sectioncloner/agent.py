@@ -39,6 +39,7 @@ TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is 
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
+FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
 TOOL_NAMES = ["get_source", "write_files", "edit_file", "compare", "finish"]
@@ -109,6 +110,8 @@ class Run:
     compared_at: int | None = None
     rebuild_height: int | None = None  # from the latest compare
     finished: bool = False
+    partial: bool = False  # finish accepted although the live files are not the last compared ones
+    failures: int = 0  # tool calls that raised; the first FAILURE_CAP are not charged to a tool's budget
     cost: float | None = None  # set by the SDK's ResultMessage; None = the run ended before reporting it
     calls: Counter = field(default_factory=Counter)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -130,6 +133,16 @@ def _err(msg: str) -> dict:
 
 LAST_COMPARE_USED = ("all compares are used: a change now could never be checked, so the files stay as last "
                      "compared; call finish and list what still differs")
+
+
+def can_reach_current(run: "Run") -> bool:
+    """Is there still a budget path to a written AND compared current state?"""
+    compares_left = run.calls["compare"] < BUDGET["compare"]
+    if run.written_at != run.mutations:  # needs a successful write, then a compare
+        writes_left = run.calls["write_files"] < BUDGET["write_files"] or (
+            bool(run.files) and run.calls["edit_file"] < BUDGET["edit_file"])
+        return writes_left and compares_left
+    return compares_left
 
 
 def no_compares_left(run: "Run") -> bool:
@@ -158,6 +171,9 @@ def guarded(run: Run, name: str):
                     res = await fn(args)
                 except Exception as e:  # noqa: BLE001 - the agent must see every failure as a tool error
                     run.log(f"{name} failed: {e}")
+                    if run.failures < FAILURE_CAP:  # a crash (timeout, API error) is not a used attempt
+                        run.failures += 1
+                        run.calls[name] -= 1
                     return _err(f"{type(e).__name__}: {e}")
                 if res.pop("_precondition", False):
                     run.calls[name] -= 1
@@ -289,10 +305,14 @@ def build_tools(run: Run):
     @tool("finish", "End the run with a short report.", {"report": str})
     @guarded(run, "finish")
     async def finish(args):
-        if run.written_at != run.mutations:
-            return _pre("the last change was not written successfully")
-        if run.compared_at != run.mutations:
-            return _pre("compare after your last change first")
+        if run.written_at != run.mutations or run.compared_at != run.mutations:
+            if can_reach_current(run):
+                return _pre("the last change was not written successfully" if run.written_at != run.mutations
+                            else "compare after your last change first")
+            # No budget left can make write + compare current again: accept, but as partial, never as done.
+            run.finished = run.partial = True
+            run.log(f"finish accepted as PARTIAL (live files not the last compared version): {args['report']}")
+            return _ok({"accepted": True, "partial": True})
         off = height_off(run)
         can_change = run.calls["edit_file"] < BUDGET["edit_file"] or run.calls["write_files"] < BUDGET["write_files"]
         if (off is not None and abs(off) > HEIGHT_TOLERANCE and can_change
@@ -341,5 +361,6 @@ async def run_agent(run: Run, model: str) -> int:
             run.cost = msg.total_cost_usd
             run.log(f"session end: {msg.subtype}, turns={msg.num_turns}, API cost={fmt_cost(run.cost)}")
     if not run.done():
-        run.log("run ended WITHOUT an accepted finish backed by a current write + compare -> exit 1")
-    return 0 if run.done() else 1
+        run.log("run ended WITHOUT an accepted finish backed by a current write + compare -> exit "
+                + ("2 (partial finish)" if run.partial else "1"))
+    return 0 if run.done() else 2 if run.partial else 1
