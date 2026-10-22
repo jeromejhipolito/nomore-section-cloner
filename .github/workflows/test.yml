@@ -4,11 +4,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   offline-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
+        with:
+          python-version: "3.11"  # the declared floor (requires-python >= 3.11)
+          enable-cache: true
+      - run: uv sync --locked  # fail if uv.lock is stale instead of silently re-resolving
       - run: uv run pytest -q
