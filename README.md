@@ -1,5 +1,11 @@
 # nomore-section-cloner
 
+[![Recording of one full run](docs/demo-preview.gif)](https://github.com/jeromejhipolito/nomore-section-cloner/releases/download/v0.1.0/demo.mp4)
+
+**▶ [Watch the full run (4 min, real time, mp4)](https://github.com/jeromejhipolito/nomore-section-cloner/releases/download/v0.1.0/demo.mp4)**: the real
+`python -m sectioncloner <url>` process from start to finish, with each side-by-side compare the agent looks at as
+it appears, ending on the rebuilt page at phone size. The GIF above is a short preview of that recording.
+
 A [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) script that takes a Shopify product
 page URL and rebuilds the page's **first 3 sections** as **one Liquid section** in your Shopify theme, as close to
 the original as possible **on mobile**. Every text and every image ends up as a theme-editor setting, so nothing
@@ -96,4 +102,29 @@ make test        # offline: the hardcoded-content linter, template shape, conten
 
 ## Live run
 
-_Filled in from the recorded run._
+The recorded run (`runs/20261022-234252`, dev store `jerome-cloner-demo`, theme Horizon):
+
+| | |
+|---|---|
+| Command | `uv run python -m sectioncloner https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis` |
+| Model | `claude-sonnet-5-5` |
+| Wall time | 3 min 11 s (scrape → write → 3 compares → finish) |
+| Turns | 15 |
+| Compares used | 3 of 4 |
+| Height, original vs rebuild (390px wide) | 2714px vs 2715px |
+| **API cost** | **$2.86** (`ResultMessage.total_cost_usd`); an earlier run cost $3.10 |
+| Exit code | 0 (finish accepted after a current write + compare) |
+| Hardcoded content in the deployed section | 0 (`lint.py` on the file read back from the store) |
+| Editable in the theme editor | 34 section settings + 22 blocks; 19 images use the source CDN URLs; fonts are `font_picker` settings |
+
+Checked by hand in the theme editor: changing a text setting and picking a new image both updated the live page.
+
+### How the video was recorded
+
+```bash
+make record      # = uv run python scripts/record_run.py <url> -o demo.mp4
+```
+
+`scripts/record_run.py` starts the real run and streams its output, live, into a small local page next to the
+latest compare image. Headless Playwright films that page, then films the rebuilt page at phone size, and ffmpeg
+joins the two clips. Nothing is replayed or sped up, and no screen capture is involved.

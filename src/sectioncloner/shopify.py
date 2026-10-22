@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -70,6 +71,14 @@ def read_files(admin: Admin, theme_id: str, names: list[str]) -> dict[str, str]:
         {"id": theme_id, "names": names},
     )["theme"]["files"]["nodes"]
     return {n["filename"]: (n["body"] or {}).get("content", "") for n in nodes}
+
+
+def parse_template(text: str):
+    """Shopify prepends a /* auto-generated */ comment to JSON templates it stores; drop it before parsing."""
+    text = text.lstrip()
+    if text.startswith("/*"):
+        text = text[text.index("*/") + 2:]
+    return json.loads(text)
 
 
 def ensure_product(admin: Admin, handle: str, title: str, price: str, template_suffix: str) -> str:

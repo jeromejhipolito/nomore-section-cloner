@@ -72,6 +72,11 @@ Rules (write_files rejects violations):
 - Add to cart must work: a form posting to /cart/add with
   `{{{{ product.selected_or_first_available_variant.id }}}}`; the chosen bundle sets the quantity. The product is a
   placeholder: show prices/labels from settings, not from the product.
+- Fonts: the digest gives each element's computed font-family. When that family is in Shopify's font library
+  (e.g. Jost, Poppins, Montserrat, Inter), add a `font_picker` setting (default like "jost_n6"), emit
+  `{{{{ section.settings.heading_font | font_face: font_display: 'swap' }}}}` in the style block and use
+  `font-family: {{{{ section.settings.heading_font.family }}}}, {{{{ section.settings.heading_font.fallback_families }}}}`.
+  Use separate pickers for headings and body text if they differ. Never link font files from the source site.
 - Interactivity in plain CSS/vanilla JS only (scroll-snap gallery with dots, radio bundle picker). No libraries.
 - Inline SVG icons (stars, check marks, arrows) are fine as markup.
 
@@ -110,7 +115,7 @@ class Run:
 def _ok(data, images: list[Path] = ()) -> dict:
     content = [{"type": "text", "text": data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)}]
     for p in images:
-        content.append({"type": "image", "data": base64.b64encode(p.read_bytes()).decode(), "mimeType": "image/png"})
+        content.append({"type": "image", "data": base64.b64encode(p.read_bytes()).decode(), "mimeType": "image/jpeg"})
     return {"content": content}
 
 
@@ -164,9 +169,9 @@ async def _write(run: Run, files: dict[str, str]) -> dict:
     back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
     if back.get(SECTION_FILE) != files[SECTION_FILE]:
         return _err("read-back of the section differs from what was written")
-    try:  # Shopify reformats template JSON, so compare parsed values
-        same_template = json.loads(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
-    except json.JSONDecodeError:
+    try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
+        same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
+    except (json.JSONDecodeError, ValueError):
         same_template = False
     if not same_template:
         return _err("read-back of the template differs from what was written")
@@ -252,6 +257,7 @@ def options_for(run: Run, model: str) -> ClaudeAgentOptions:
         setting_sources=[],  # don't inherit the developer's ~/.claude settings or hooks
         max_turns=MAX_TURNS,
         model=model,
+        max_buffer_size=16 * 1024 * 1024,  # tool results carry screenshots; the 1MB default overflows
     )
 
 

@@ -7,7 +7,15 @@ install:
 run:
 	uv run python -m sectioncloner $(URL)
 
+show:
+	uv run python -m sectioncloner.show
+
+demo: run show
+
+record:
+	uv run python scripts/record_run.py $(URL) -o demo.mp4
+
 test:
 	uv run pytest -q
 
-.PHONY: install run test
+.PHONY: install run show demo record test

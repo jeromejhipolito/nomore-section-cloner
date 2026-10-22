@@ -69,3 +69,10 @@ def test_content_gaps_finds_missing_text_and_images():
     gaps = content_gaps(src, files)
     assert gaps["missing_texts"] == ["Free shipping today"]  # "ok" is too short to count
     assert gaps["missing_image_paths"] == ["/cdn/shop/files/b.jpg"]
+
+
+def test_parse_template_strips_shopify_header():
+    from sectioncloner.shopify import parse_template
+    stored = "/*\n * IMPORTANT: The contents of this file are auto-generated.\n */\n{\"order\": [\"k\"]}"
+    assert parse_template(stored) == {"order": ["k"]}
+    assert parse_template('{"order": []}') == {"order": []}

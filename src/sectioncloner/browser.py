@@ -16,6 +16,8 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 WIDTH, HEIGHT = 390, 844
 TILE_H = 900
+MIN_TAIL = 200  # a last tile shorter than this is merged into the one before it
+JPEG_Q = 70  # PNG tiles of a busy page overflow the SDK message buffer; JPEG is ~5x smaller
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
 REBUILD_SELECTOR = '[id$="__nomore_landing"]'
@@ -134,9 +136,11 @@ def _tiles(page: Page, top: float, height: float, out: Path, prefix: str) -> Sho
     shot = Shot(height=round(height))
     y, i = top, 0
     while y < top + height - 1:
-        h = min(TILE_H, top + height - y)
-        path = out / f"{prefix}-{i}.png"
-        page.screenshot(path=str(path), full_page=True, clip={"x": 0, "y": y, "width": WIDTH, "height": h})
+        rest = top + height - y
+        h = rest if rest <= TILE_H + MIN_TAIL else TILE_H  # fold a thin tail into this tile, not its own image
+        path = out / f"{prefix}-{i}.jpg"
+        page.screenshot(path=str(path), type="jpeg", quality=JPEG_Q, full_page=True,
+                        clip={"x": 0, "y": y, "width": WIDTH, "height": h})
         shot.tiles.append(path)
         y, i = y + h, i + 1
     return shot
@@ -193,22 +197,23 @@ def side_by_side(src: Shot, dst: Shot, out: Path, prefix: str) -> list[Path]:
     paths = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": WIDTH * 2 + 10, "height": TILE_H}, device_scale_factor=1)
+        # Short viewport: full_page then sizes each pair to its tallest image instead of padding to TILE_H.
+        page = browser.new_page(viewport={"width": WIDTH * 2 + 10, "height": 100}, device_scale_factor=1)
         try:
             for i in range(bands):
                 cells = []
                 for shot in (src, dst):
                     if i < len(shot.tiles):
                         b64 = base64.b64encode(shot.tiles[i].read_bytes()).decode()
-                        cells.append(f'<img src="data:image/png;base64,{b64}">')
+                        cells.append(f'<img src="data:image/jpeg;base64,{b64}">')
                     else:
                         cells.append('<div class="end">(ends)</div>')
                 page.set_content(
                     "<style>body{margin:0;display:flex;gap:10px;background:#f0f;align-items:flex-start}"
                     f"img,.end{{width:{WIDTH}px;display:block}}.end{{height:80px;background:#fff}}</style>"
                     + "".join(cells))
-                path = out / f"{prefix}-pair-{i}.png"
-                page.screenshot(path=str(path), full_page=True)
+                path = out / f"{prefix}-pair-{i}.jpg"
+                page.screenshot(path=str(path), type="jpeg", quality=JPEG_Q, full_page=True)
                 paths.append(path)
         finally:
             browser.close()
