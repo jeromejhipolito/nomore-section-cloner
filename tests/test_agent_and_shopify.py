@@ -8,6 +8,7 @@ import httpx
 
 from sectioncloner import shopify
 from sectioncloner.agent import BUDGET, Run, build_tools
+from sectioncloner.browser import Shot, Source
 
 
 class FakeAdmin:
@@ -82,3 +83,23 @@ def test_placeholder_product_is_idempotent_and_sellable():
     first, second = sent[0]["variables"], sent[3]["variables"]
     assert first == second and first["id"] == {"handle": "h"}
     assert first["input"]["variants"][0]["inventoryPolicy"] == "CONTINUE"
+
+
+def test_finish_refused_while_height_is_off_and_compares_remain(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=2714))
+    run.mutations = run.written_at = run.compared_at = 1
+    run.product_url = "https://x.myshopify.com/products/p"
+    run.rebuild_height, run.calls["compare"] = 2627, 2  # 3.2% short, 2 compares left
+    assert _call(tools["finish"], {"report": "x"}).get("is_error")
+    run.calls["compare"] = BUDGET["compare"]  # out of compares: finishing is allowed, the gap is reported
+    assert not _call(tools["finish"], {"report": "x"}).get("is_error")
+
+
+def test_finish_allowed_when_height_is_close(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=2714))
+    run.mutations = run.written_at = run.compared_at = 1
+    run.product_url = "https://x.myshopify.com/products/p"
+    run.rebuild_height, run.calls["compare"] = 2715, 1
+    assert not _call(tools["finish"], {"report": "x"}).get("is_error")

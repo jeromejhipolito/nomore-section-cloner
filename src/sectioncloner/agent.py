@@ -38,6 +38,7 @@ TEMPLATE_FILE = f"templates/product.{TEMPLATE_SUFFIX}.json"
 TEMPLATE_KEY = "nomore_landing"  # renders as id="shopify-section-template--…__nomore_landing"
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
+HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
 TOOL_NAMES = ["get_source", "write_files", "edit_file", "compare", "finish"]
@@ -84,7 +85,8 @@ Rules (write_files rejects violations):
 
 compare renders your section on the live store and returns side-by-side images (left = original, right = yours)
 per band. Fix the biggest visual differences first (layout, sizes, spacing, font size/weight, colours, order),
-using edit_file for targeted changes. You have {BUDGET['compare']} compares in total.
+using edit_file for targeted changes. You have {BUDGET['compare']} compares in total. finish is refused while
+your section's height is more than {HEIGHT_TOLERANCE:.1%} off the original and you still have compares left.
 
 finish is accepted only when the latest files were written AND compared after the last change. Call it with a
 one-paragraph report of what matches and what still differs."""
@@ -105,6 +107,7 @@ class Run:
     mutations: int = 0
     written_at: int | None = None  # mutations value when the last write was read back and matched
     compared_at: int | None = None
+    rebuild_height: int | None = None  # from the latest compare
     finished: bool = False
     cost: float = 0.0
     calls: Counter = field(default_factory=Counter)
@@ -153,6 +156,13 @@ def guarded(run: Run, name: str):
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s))).strip().lower()
+
+
+def height_off(run: "Run") -> float | None:
+    """Rebuild height relative to the source (+ = taller), from the latest compare."""
+    if run.rebuild_height is None or run.source is None or not run.source.shot.height:
+        return None
+    return run.rebuild_height / run.source.shot.height - 1
 
 
 def _strings(v) -> list[str]:
@@ -252,6 +262,7 @@ def build_tools(run: Run):
         shot = await asyncio.to_thread(browser.shoot_rebuild, run.product_url, run.password, run.out, f"rebuild{i}")
         pairs = await asyncio.to_thread(browser.side_by_side, run.source.shot, shot, run.out, f"cmp{i}")
         run.compared_at = run.mutations
+        run.rebuild_height = shot.height
         left = BUDGET["compare"] - i
         run.log(f"compare #{i}: source {run.source.shot.height}px vs rebuild {shot.height}px, {left} left")
         return _ok(f"Original {run.source.shot.height}px tall, yours {shot.height}px. Left=original, right=yours. "
@@ -264,6 +275,10 @@ def build_tools(run: Run):
             return _pre("the last change was not written successfully")
         if run.compared_at != run.mutations:
             return _pre("compare after your last change first")
+        off = height_off(run)
+        if off is not None and abs(off) > HEIGHT_TOLERANCE and run.calls["compare"] < BUDGET["compare"]:
+            return _pre(f"your section is {off:+.1%} the height of the original ({run.rebuild_height}px vs "
+                        f"{run.source.shot.height}px); use a remaining compare to close the gap first")
         run.finished = True
         run.log(f"finish accepted: {args['report']}")
         return _ok({"accepted": True})
