@@ -108,3 +108,17 @@ def test_content_gaps_no_false_positives_for_case_or_quotes():
                                                           "img": "https://s.example/cdn/shop/files/IMG_01.jpg"})}
     gaps = content_gaps(src, files)
     assert gaps["missing_texts"] == [] and gaps["missing_image_paths"] == []
+
+
+def test_copy_hidden_in_liquid_filters_and_tags_is_caught():
+    for bad in ["{{ block.settings.label | default: 'Best Seller' }}", "{{ price | append: ' OFF' }}",
+                "{%- assign cta = 'Add to cart' -%}{{ cta }}", "{{ \"Don't miss out\" }}"]:
+        assert any("Liquid string" in p for p in lint.check_section(CLEAN.replace("{{ section.settings.title }}", bad))), bad
+
+
+def test_machine_keys_in_liquid_and_radio_values_pass():
+    ok = CLEAN.replace("{{ section.settings.title }}",
+                       "{% if b == 'two-pack' %}{{ section.settings.title | default: '' }}{% endif %}"
+                       "{{ section.settings.font | font_face: font_display: 'swap' }}"
+                       '<input type="radio" name="bundle" value="two-pack">{{ \'products.add\' | t }}')
+    assert lint.check_section(ok) == []

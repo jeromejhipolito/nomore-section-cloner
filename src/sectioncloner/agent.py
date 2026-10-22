@@ -35,7 +35,7 @@ SECTION_TYPE = "nomore-landing"
 SECTION_FILE = f"sections/{SECTION_TYPE}.liquid"
 TEMPLATE_SUFFIX = "nomore"
 TEMPLATE_FILE = f"templates/product.{TEMPLATE_SUFFIX}.json"
-TEMPLATE_KEY = "nomore_landing"  # renders as id="shopify-section-template--…__nomore_landing"
+TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is built from it
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
@@ -109,7 +109,7 @@ class Run:
     compared_at: int | None = None
     rebuild_height: int | None = None  # from the latest compare
     finished: bool = False
-    cost: float = 0.0
+    cost: float | None = None  # set by the SDK's ResultMessage; None = the run ended before reporting it
     calls: Counter = field(default_factory=Counter)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -128,6 +128,10 @@ def _err(msg: str) -> dict:
     return {"content": [{"type": "text", "text": f"ERROR: {msg}"}], "is_error": True}
 
 
+def fmt_cost(cost: float | None) -> str:
+    return "unknown (no result from the SDK)" if cost is None else f"${cost:.4f}"
+
+
 def _pre(msg: str) -> dict:
     """A precondition refusal: reported to the agent like an error, but not charged to the tool's budget."""
     return _err(msg) | {"_precondition": True}
@@ -136,20 +140,20 @@ def _pre(msg: str) -> dict:
 def guarded(run: Run, name: str):
     def wrap(fn):
         async def inner(args):
-            run.calls[name] += 1
-            if run.finished:
-                return _err("run already finished")
-            if run.calls[name] > BUDGET[name]:
-                return _err(f"budget for {name} exhausted ({BUDGET[name]}); call finish")
-            try:
-                async with run.lock:
+            async with run.lock:  # counters too: parallel tool calls must not share a compare index
+                run.calls[name] += 1
+                if run.finished:
+                    return _err("run already finished")
+                if run.calls[name] > BUDGET[name]:
+                    return _err(f"budget for {name} exhausted ({BUDGET[name]}); call finish")
+                try:
                     res = await fn(args)
+                except Exception as e:  # noqa: BLE001 - the agent must see every failure as a tool error
+                    run.log(f"{name} failed: {e}")
+                    return _err(f"{type(e).__name__}: {e}")
                 if res.pop("_precondition", False):
                     run.calls[name] -= 1
                 return res
-            except Exception as e:  # noqa: BLE001 - the agent must see every failure as a tool error
-                run.log(f"{name} failed: {e}")
-                return _err(f"{type(e).__name__}: {e}")
         return inner
     return wrap
 
@@ -192,7 +196,7 @@ async def _write(run: Run, files: dict[str, str]) -> dict:
     problems = (lint.check_section(files[SECTION_FILE])
                 + lint.check_template(files[TEMPLATE_FILE], SECTION_TYPE, TEMPLATE_KEY))
     if problems:
-        return _err("not written; fix these first:\n- " + "\n- ".join(problems[:30]))
+        return _pre("not written; fix these first:\n- " + "\n- ".join(problems[:30]))  # not charged
     if run.theme_id is None:
         run.theme_id = await asyncio.to_thread(shopify.main_theme_id, run.admin)
     run.mutations += 1  # before the write: a partial failure must invalidate the last verify
@@ -276,7 +280,9 @@ def build_tools(run: Run):
         if run.compared_at != run.mutations:
             return _pre("compare after your last change first")
         off = height_off(run)
-        if off is not None and abs(off) > HEIGHT_TOLERANCE and run.calls["compare"] < BUDGET["compare"]:
+        can_change = run.calls["edit_file"] < BUDGET["edit_file"] or run.calls["write_files"] < BUDGET["write_files"]
+        if (off is not None and abs(off) > HEIGHT_TOLERANCE and can_change
+                and run.calls["compare"] < BUDGET["compare"]):
             return _pre(f"your section is {off:+.1%} the height of the original ({run.rebuild_height}px vs "
                         f"{run.source.shot.height}px); use a remaining compare to close the gap first")
         run.finished = True
@@ -318,8 +324,8 @@ async def run_agent(run: Run, model: str) -> int:
                     imgs = sum(isinstance(c, dict) and c.get("type") == "image" for c in parts)
                     run.log(f"<- {'ERROR ' if b.is_error else ''}{text[:300]}" + (f" [+{imgs} images]" if imgs else ""))
         elif isinstance(msg, ResultMessage):
-            run.cost = msg.total_cost_usd or 0.0
-            run.log(f"session end: {msg.subtype}, turns={msg.num_turns}, API cost=${run.cost:.4f}")
+            run.cost = msg.total_cost_usd
+            run.log(f"session end: {msg.subtype}, turns={msg.num_turns}, API cost={fmt_cost(run.cost)}")
     if not run.done():
         run.log("run ended WITHOUT an accepted finish backed by a current write + compare -> exit 1")
     return 0 if run.done() else 1

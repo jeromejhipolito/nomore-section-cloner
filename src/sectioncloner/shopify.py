@@ -75,6 +75,7 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
 def missing_scopes(admin: Admin, needed: set[str]) -> list[str]:
     have = {s["handle"] for s in admin.gql("{ currentAppInstallation { accessScopes { handle } } }")
             ["currentAppInstallation"]["accessScopes"]}
+    have |= {"read_" + s.removeprefix("write_") for s in have if s.startswith("write_")}  # write_X implies read_X
     return sorted(needed - have)
 
 

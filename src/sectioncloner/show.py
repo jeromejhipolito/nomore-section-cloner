@@ -18,7 +18,8 @@ PHONE = {"viewport": {"width": WIDTH, "height": HEIGHT}, "user_agent": UA, "is_m
 
 
 def product_url() -> str:
-    return f"https://{os.environ['SHOPIFY_STORE_DOMAIN']}/products/{PRODUCT_HANDLE}"
+    domain = os.environ["SHOPIFY_STORE_DOMAIN"].removeprefix("https://").strip("/")  # same as shopify.Admin
+    return f"https://{domain}/products/{PRODUCT_HANDLE}"
 
 
 def tour(page: Page, url: str, password: str, hold: float = 6) -> None:

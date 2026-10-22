@@ -17,8 +17,9 @@ CODE_BLOCKS = re.compile(
     re.S | re.I,
 )
 LIQUID = re.compile(r"{{.*?}}|{%.*?%}", re.S)
-# `{{ 'Buy now' }}` / `{{ "Buy" | upcase }}` is copy typed into the markup; `{{ 'x' | t }}` is a translation key.
-QUOTED_OUTPUT = re.compile(r"{{-?\s*(['\"])([^'\"]*[A-Za-z][^'\"]*)\1(?![^}]*\|\s*(?:t|asset_url)\b)[^}]*}}")
+# A quoted literal inside a Liquid tag/output that reads like copy: has a space or starts uppercase
+# ('Best Seller', ' OFF', "Don't miss out"). Keys like 'two-pack', 'swap', 'icon-check' don't. `| t` keys are fine.
+LIQUID_LITERAL = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 CSS_REMOTE_URL = re.compile(r"url\(\s*['\"]?\s*(?:https?:)?//", re.I)
 TEXT_ATTRS = {"alt", "title", "placeholder", "aria-label", "content", "value"}
 URL_ATTRS = {"src", "srcset", "href", "poster"}
@@ -41,8 +42,9 @@ class _Collector(HTMLParser):
             literal = (v or "").replace(MARK, "").strip()
             if not literal:
                 continue
-            # value="1" (a quantity) is fine; value="Add to cart" is copy.
-            if (k in TEXT_ATTRS and (k != "value" or re.search(r"[A-Za-z]", literal))) or (
+            # value= is visible only on buttons; on radios/hidden inputs it is a key ("two-pack", "2").
+            visible_value = tag in ("button", "input") and dict(attrs).get("type") in ("submit", "button", "reset")
+            if (k in TEXT_ATTRS and (k != "value" or (visible_value and re.search(r"[A-Za-z]", literal)))) or (
                     k in URL_ATTRS and LITERAL_URL.search(literal)):
                 self.problems.append(f"hardcoded {k}= on <{tag}>: {literal[:60]!r}")
 
@@ -61,7 +63,12 @@ def check_section(liquid: str) -> list[str]:
     except (ValueError, json.JSONDecodeError) as e:
         return [f"schema: {e}"]
     problems = _check_schema(schema)
-    problems += [f"hardcoded text in a Liquid string: {m.group(2)[:60]!r}" for m in QUOTED_OUTPUT.finditer(markup)]
+    for tag in LIQUID.finditer(CODE_BLOCKS.sub("", markup)):
+        for m in LIQUID_LITERAL.finditer(tag.group(0)):
+            lit = m.group(1) if m.group(1) is not None else m.group(2)
+            translated = re.match(r"\s*\|\s*t\b", tag.group(0)[m.end():])
+            if re.search(r"[A-Za-z]", lit) and (" " in lit or lit.lstrip()[:1].isupper()) and not translated:
+                problems.append(f"hardcoded text in a Liquid string: {lit[:60]!r}")
     for m in STYLE_BLOCKS.finditer(markup):
         if CSS_REMOTE_URL.search(LIQUID.sub("", m.group(2) or m.group(3) or "")):
             problems.append("remote url(...) in CSS (put the image in a setting)")

@@ -20,7 +20,8 @@ MIN_TAIL = 200  # a last tile shorter than this is merged into the one before it
 JPEG_Q = 70  # PNG tiles of a busy page overflow the SDK message buffer; JPEG is ~5x smaller
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
-REBUILD_SELECTOR = '[id$="__nomore_landing"]'
+TEMPLATE_KEY = "nomore_landing"  # the template's section key; Shopify renders id="shopify-section-…__<key>"
+REBUILD_SELECTOR = f'[id$="__{TEMPLATE_KEY}"]'
 
 # Walks the DOM of the chosen sections and prints one indented line per meaningful element:
 # tag.class [w x h] {styles that matter} "own text" img(src). Wrapper divs with nothing of their own

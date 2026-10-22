@@ -103,3 +103,36 @@ def test_finish_allowed_when_height_is_close(tmp_path):
     run.product_url = "https://x.myshopify.com/products/p"
     run.rebuild_height, run.calls["compare"] = 2715, 1
     assert not _call(tools["finish"], {"report": "x"}).get("is_error")
+
+
+def test_finish_allowed_when_nothing_can_change_anymore(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=2714))
+    run.mutations = run.written_at = run.compared_at = 1
+    run.product_url = "https://x.myshopify.com/products/p"
+    run.rebuild_height, run.calls["compare"] = 2627, 2
+    run.calls["edit_file"], run.calls["write_files"] = BUDGET["edit_file"], BUDGET["write_files"]
+    assert not _call(tools["finish"], {"report": "x"}).get("is_error")  # no deadlock: the gap goes in the report
+
+
+def test_lint_rejection_is_not_charged_to_the_write_budget(tmp_path):
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=1))
+    for _ in range(BUDGET["write_files"] + 2):
+        res = _call(tools["write_files"], {"section_liquid": "<p>hardcoded</p>", "template_json": "{}"})
+        assert res.get("is_error")
+    assert run.calls["write_files"] == 0
+
+
+def test_write_scope_implies_read_scope():
+    sent = []
+    a = _admin([(200, {"data": {"currentAppInstallation": {"accessScopes": [
+        {"handle": h} for h in ("write_products", "write_themes", "write_publications")]}}})], sent)
+    assert shopify.missing_scopes(a, shopify.SCOPES) == []
+
+
+def test_cost_is_unknown_not_zero_when_the_sdk_never_reported_it(tmp_path):
+    from sectioncloner.agent import fmt_cost
+    run, _ = _tools(tmp_path)
+    assert run.cost is None and fmt_cost(run.cost).startswith("unknown")
+    assert fmt_cost(2.6608) == "$2.6608"
