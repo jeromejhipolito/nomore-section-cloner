@@ -16,6 +16,7 @@ from . import shopify
 from .agent import EXIT_PARTIAL, Run, fmt_cost, run_agent
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+EXIT_SHOPIFY_DOWN = 4  # a temporary outage before the agent started: retry, nothing is wrong with the setup
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,7 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         lacking = shopify.missing_scopes(admin, shopify.SCOPES)
     except shopify.ShopifyTransientError as e:
         print(f"Shopify is unreachable or erroring right now (not a config problem), retry: {e}", file=sys.stderr)
-        return 2
+        return EXIT_SHOPIFY_DOWN
     except shopify.ShopifyError as e:
         print(f"cannot use the Admin API token: {e}", file=sys.stderr)
         return 2

@@ -43,7 +43,7 @@ TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is 
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
-EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error (CLI) · 3 finished partial
+EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error · 3 finished partial · 4 Shopify down (CLI)
 FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
 
@@ -190,6 +190,13 @@ async def settle(run: "Run") -> None:
     except Exception as e:  # noqa: BLE001 - reported, and the exit code says partial/failed
         run.log(f"could not put the last compared version back live: {e}")
         return
+    if ok and shopify.lost_track:  # an earlier write we lost track of could still land: look again after a grace
+        run.log(f"{shopify.lost_track} earlier write(s) could not be confirmed; re-checking the store after "
+                f"{shopify.UNCONFIRMED_GRACE_S}s")
+        await asyncio.sleep(shopify.UNCONFIRMED_GRACE_S)
+        back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
+        ok = back.get(SECTION_FILE) == run.good[SECTION_FILE] and shopify.parse_template(
+            back.get(TEMPLATE_FILE, "null")) == json.loads(run.good[TEMPLATE_FILE])
     if ok:
         run.mutations += 1
         run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations  # identical content

@@ -51,10 +51,11 @@ caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) 
 | `1` | no compared version exists (even if `finish` was accepted), or the session ended without an accepted `finish` (putting the last compared version back is still attempted; the log says if it worked) |
 | `2` | usage/config error before the agent started (bad URL, missing `.env` key, token scopes) |
 | `3` | `finish` accepted, but the store could not be put back on the last compared version (the log says why) |
+| `4` | Shopify was unreachable or erroring before the agent started: nothing is misconfigured, retry |
 
 Once the agent has started, the run's final status line includes its **API cost** (`ResultMessage.total_cost_usd`), even
 when it fails; it reads `unknown` only if the SDK never reported a result. Exit `2` stops before the agent starts, so it
-costs nothing (a temporary Shopify outage at that point is reported as such, so retry).
+costs nothing; a temporary Shopify outage at that point exits `4` instead, so a script can retry it.
 
 ### "No hardcoded content" is enforced, not requested
 

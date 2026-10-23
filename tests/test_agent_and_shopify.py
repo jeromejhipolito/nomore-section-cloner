@@ -4,11 +4,23 @@ import asyncio
 import json
 from pathlib import Path
 
+import threading
+import time
+
 import httpx
+import pytest
 
 from sectioncloner import shopify
 from sectioncloner.agent import BUDGET, Run, build_tools
 from sectioncloner.browser import Shot, Source
+
+
+@pytest.fixture(autouse=True)
+def fresh_write_state(monkeypatch):
+    """shopify keeps process-wide write state (lock queue, closed flag); every test starts clean."""
+    monkeypatch.setattr(shopify, "_pending_jobs", [])
+    monkeypatch.setattr(shopify, "_closed", threading.Event())
+    monkeypatch.setattr(shopify, "lost_track", 0)
 
 
 class FakeAdmin:
@@ -299,52 +311,68 @@ def test_a_job_that_outlived_polling_finishes_before_the_next_write(monkeypatch)
 
 
 
-def test_a_stale_queued_write_is_refused_after_the_final_restore(monkeypatch):
-    monkeypatch.setattr(shopify, "_pending_jobs", [])
-    monkeypatch.setattr(shopify, "_generation", 0)
-    ok = {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}}
+OK_UPSERT = {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}}
+
+
+def test_no_ordinary_write_lands_after_the_final_restore():
     sent = []
-    a = _admin([(200, ok)], sent)
-    with shopify._UPLOAD_LOCK:  # an orphan write is queued behind the lock...
-        import threading
-        result = {}
-        def orphan():
-            try:
-                shopify.upsert_files(a, "t", {"sections/x.liquid": "stale"})
-            except shopify.ShopifyError as e:
-                result["err"] = str(e)
-        t = threading.Thread(target=orphan); t.start()
-        import time; time.sleep(0.2)
-        with shopify._gen_lock:  # ...when settle() starts the final restore
-            shopify._generation += 1
+    a = _admin([(200, OK_UPSERT)], sent)
+    result = {}
+
+    def orphan():
+        try:
+            shopify.upsert_files(a, "t", {"sections/x.liquid": "stale"})
+        except shopify.ShopifyError as e:
+            result["queued"] = str(e)
+    with shopify._UPLOAD_LOCK:  # an orphan write is queued behind the lock when the final restore starts
+        t = threading.Thread(target=orphan)
+        t.start()
+        time.sleep(0.2)
+        shopify._closed.set()
     t.join(5)
-    assert "superseded" in result.get("err", "") and sent == []  # the stale write never reached Shopify
+    assert "superseded" in result.get("queued", "")
+    try:  # and an orphan whose thread only starts AFTER the restore began is refused too
+        shopify.upsert_files(a, "t", {"sections/x.liquid": "late"})
+    except shopify.ShopifyError as e:
+        assert "superseded" in str(e)
+    else:
+        raise AssertionError("a late ordinary write was accepted after the final restore")
+    shopify.upsert_files(a, "t", {"sections/x.liquid": "good"}, final=True)  # the restore itself goes through
+    assert len(sent) == 1
 
 
-def test_unknown_job_counts_as_finished_and_unconfirmed_writes_get_a_grace(monkeypatch):
+def test_an_unknown_job_is_polled_not_assumed_finished_and_unconfirmed_writes_are_counted(monkeypatch):
     monkeypatch.setattr(shopify, "_pending_jobs", [None, "gid://shopify/Job/9"])
-    monkeypatch.setattr(shopify, "_generation", 0)
-    slept = []
-    sent = []
-    a = _admin([(200, {"data": {"job": None}}),  # Shopify no longer knows job 9: finished
-                (200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}})],
-               sent)
+    slept, sent = [], []
+    a = _admin([(200, {"data": {"job": None}}),                                 # not queryable yet: keep polling
+                (200, {"data": {"job": {"id": "gid://shopify/Job/9", "done": True}}}),
+                (200, OK_UPSERT)], sent)
     a.sleep = slept.append
     shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
-    assert slept == [shopify.UNCONFIRMED_GRACE_S] and shopify._pending_jobs == []
+    assert shopify._pending_jobs == [] and slept == [shopify.UNCONFIRMED_GRACE_S, 1]
+    assert shopify.lost_track == 1  # the in-flight write could only be waited out, never confirmed
 
 
-def test_a_write_that_failed_in_flight_is_not_resent_and_is_waited_out_next_time(monkeypatch):
-    monkeypatch.setattr(shopify, "_pending_jobs", [])
-    monkeypatch.setattr(shopify, "_generation", 0)
-    calls = []
-    def flaky(request):
-        calls.append(1)
-        raise httpx.ReadTimeout("timed out")
-    a = shopify.Admin("s.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(flaky)),
-                      sleep=lambda s: None)
+def test_resend_policy_for_writes():
+    def client(errors):
+        calls = []
+        def handler(request):
+            calls.append(1)
+            if errors:
+                raise errors.pop(0)
+            return httpx.Response(200, json=OK_UPSERT)
+        return calls, shopify.Admin("s.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(handler)),
+                                    sleep=lambda s: None)
+    calls, a = client([httpx.ReadTimeout("t")])  # may have reached Shopify: not re-sent, waited out next time
     try:
         shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
     except shopify.ShopifyTransientError:
         pass
-    assert len(calls) == 1 and shopify._pending_jobs == [None]  # not re-sent; next write gives it a grace period
+    assert len(calls) == 1 and shopify._pending_jobs == [None]
+    shopify._pending_jobs.clear()
+    calls, a = client([httpx.ConnectError("refused")])  # never reached Shopify: safe to retry
+    shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    assert len(calls) == 2 and shopify._pending_jobs == []
+    calls, a = client([httpx.ReadTimeout("t")])  # the final restore is idempotent: it retries
+    shopify.upsert_files(a, "t", {"sections/x.liquid": "1"}, final=True)
+    assert len(calls) == 2

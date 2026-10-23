@@ -10,17 +10,14 @@ import httpx
 
 API_VERSION = "2026-01"
 JOB_POLLS = 120  # seconds; Shopify's theme job queue can be slow
-# One theme write at a time, for the whole process: an upload left running by a cancelled tool call, or a job
-# that outlived its polling, finishes BEFORE the next write (e.g. the final restore) starts, so it can't land after.
-_UPLOAD_LOCK = threading.Lock()
-# Jobs we stopped waiting on before they were confirmed done. None = a write whose request failed in flight, so
-# Shopify may or may not have accepted it: the next write gives it UNCONFIRMED_GRACE_S to land first.
-_pending_jobs: list[str | None] = []
 UNCONFIRMED_GRACE_S = 20
-# The final restore bumps the generation; an ordinary write still queued behind the lock from before then is
-# stale (its tool call was cancelled) and is refused instead of landing after the restore.
-_generation = 0
-_gen_lock = threading.Lock()
+# One theme write at a time for the whole process. Before writing, every earlier write that may still be
+# landing (a job we stopped polling, or a request that failed after it may have reached Shopify) is drained.
+_UPLOAD_LOCK = threading.Lock()
+_pending_jobs: list[str | None] = []  # None = a write request that failed in flight (may or may not have landed)
+# Set by the end-of-session restore: from then on no ordinary write is accepted, however late its thread runs.
+_closed = threading.Event()
+lost_track = 0  # earlier writes the drain could not confirm before letting the next write go ahead
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
@@ -33,7 +30,13 @@ class ShopifyError(RuntimeError):
 
 
 class ShopifyTransientError(ShopifyError):
-    """Infra trouble worth a free retry: unreachable, 5xx, still throttled. Never the caller's own mistake."""
+    """Infra trouble worth a free retry: unreachable, 5xx, still throttled. Never the caller's own mistake.
+
+    maybe_applied: the request may have reached Shopify (read timeout, 5xx, ...), so a write could still land."""
+
+    def __init__(self, msg: str, maybe_applied: bool = False):
+        super().__init__(msg)
+        self.maybe_applied = maybe_applied
 
 
 class Admin:
@@ -51,12 +54,13 @@ class Admin:
                                    headers=self.headers)
                 body = r.json() if r.status_code == 200 else None
             except httpx.TransportError as e:  # DNS / reset / timeout: retry, then a clean error
-                if attempt < 4 and retry_transport:  # never blindly re-send a write that may have landed
+                sent = not isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))  # did it reach Shopify?
+                if attempt < 4 and (retry_transport or not sent):  # never blindly re-send a write that may have landed
                     self.sleep(min(2**attempt, 20))
                     continue
-                raise ShopifyTransientError(f"cannot reach {self.domain}: {e}") from e
+                raise ShopifyTransientError(f"cannot reach {self.domain}: {e}", maybe_applied=sent) from e
             except ValueError as e:  # a 200 that isn't JSON (an HTML interstitial)
-                raise ShopifyTransientError(f"Admin API returned non-JSON: {r.text[:200]}") from e
+                raise ShopifyTransientError(f"Admin API returned non-JSON: {r.text[:200]}", maybe_applied=True) from e
             throttled = body is not None and any(
                 (e.get("extensions") or {}).get("code") == "THROTTLED" for e in body.get("errors") or [])
             if r.status_code == 429 or throttled:
@@ -64,12 +68,14 @@ class Admin:
                     self.sleep(min(2**attempt, 20))
                 continue
             if r.status_code != 200:
-                err = ShopifyTransientError if r.status_code >= 500 else ShopifyError
-                raise err(f"Admin API HTTP {r.status_code}: {r.text[:300]}")
+                if r.status_code >= 500:
+                    raise ShopifyTransientError(f"Admin API HTTP {r.status_code}: {r.text[:300]}", maybe_applied=True)
+                raise ShopifyError(f"Admin API HTTP {r.status_code}: {r.text[:300]}")
             if body.get("errors"):
                 codes = {(e.get("extensions") or {}).get("code") for e in body["errors"]}
-                err = ShopifyTransientError if codes & {"INTERNAL_SERVER_ERROR", "TIMEOUT"} else ShopifyError
-                raise err(f"GraphQL errors: {body['errors']}")
+                if codes & {"INTERNAL_SERVER_ERROR", "TIMEOUT"}:
+                    raise ShopifyTransientError(f"GraphQL errors: {body['errors']}", maybe_applied=True)
+                raise ShopifyError(f"GraphQL errors: {body['errors']}")
             return body["data"]
         raise ShopifyTransientError("Admin API stayed throttled after 5 attempts")
 
@@ -89,46 +95,51 @@ def main_theme_id(admin: Admin) -> str:
 def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool = False) -> None:
     """Write text files to the theme. Shopify validates Liquid/JSON here and returns userErrors.
 
-    final=True is the end-of-session restore: it supersedes any ordinary write still waiting for the lock."""
-    global _generation
-    with _gen_lock:
-        if final:
-            _generation += 1
-        mine = _generation
+    final=True is the end-of-session restore: it closes the store to every later ordinary write, and (being
+    idempotent) it retries transport errors instead of giving up on the one write that must succeed."""
+    if final:
+        _closed.set()
     with _UPLOAD_LOCK:
-        if not final and mine != _generation:
+        if not final and _closed.is_set():
             raise ShopifyError("superseded by the final restore: not written")
         _drain_pending(admin)
-        _upsert(admin, theme_id, files)
+        _upsert(admin, theme_id, files, final)
 
 
 def _drain_pending(admin: Admin) -> None:
-    """Let every earlier write land before this one. Bounded: a job that can't be confirmed is waited out once."""
+    """Let every earlier write land before this one. Bounded, and never silent: what can't be confirmed is counted."""
+    global lost_track
     while _pending_jobs:
-        job_id = _pending_jobs.pop(0)
+        job_id = _pending_jobs[0]
         try:
-            if job_id is None:
+            if job_id is None:  # a request that failed in flight: no job id to ask about, only time
                 admin.sleep(UNCONFIRMED_GRACE_S)
+                lost_track += 1
             else:
                 _wait_job(admin, job_id)
-        except ShopifyError:  # can't confirm it (still running / unknown id): give it the grace period, move on
+        except Exception:  # noqa: BLE001 - can't confirm it: give it the grace period, count it, move on
             admin.sleep(UNCONFIRMED_GRACE_S)
+            lost_track += 1
+        finally:
+            _pending_jobs.pop(0)
 
 
 def _wait_job(admin: Admin, job_id: str) -> None:
     for _ in range(JOB_POLLS):
-        job = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id})["job"]
-        if job is None or job["done"]:  # None: Shopify no longer knows the job, i.e. it is long finished
+        data = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id}) or {}
+        job = data.get("job")  # None can mean "not queryable yet", so it is never read as "finished"
+        if job and job.get("done"):
             return
         admin.sleep(1)
-    raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s")
+    raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s", maybe_applied=True)
 
 
-def _upsert(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
+def _upsert(admin: Admin, theme_id: str, files: dict[str, str], final: bool) -> None:
     try:
-        data = _upsert_request(admin, theme_id, files)
-    except ShopifyTransientError:
-        _pending_jobs.append(None)  # it may have been accepted: the next write waits for it to land
+        data = _upsert_request(admin, theme_id, files, retry_transport=final)
+    except ShopifyTransientError as e:
+        if e.maybe_applied:
+            _pending_jobs.append(None)  # it may have been accepted: the next write waits for it to land
         raise
     _raise_user_errors(data["userErrors"])
     job = data.get("job")
@@ -139,14 +150,14 @@ def _upsert(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
     _pending_jobs.remove(job["id"])
 
 
-def _upsert_request(admin: Admin, theme_id: str, files: dict[str, str]) -> dict:
+def _upsert_request(admin: Admin, theme_id: str, files: dict[str, str], retry_transport: bool) -> dict:
     return admin.gql(
         """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
           themeFilesUpsert(themeId: $themeId, files: $files) {
             upsertedThemeFiles { filename } job { id done } userErrors { field message } } }""",
         {"themeId": theme_id,
          "files": [{"filename": n, "body": {"type": "TEXT", "value": v}} for n, v in files.items()]},
-        retry_transport=False,
+        retry_transport=retry_transport,
     )["themeFilesUpsert"]
 
 
