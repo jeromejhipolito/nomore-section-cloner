@@ -33,6 +33,7 @@ from sectioncloner.show import PHONE, product_url, tour
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_URL = "https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis"
 SIZE = {"width": 1280, "height": 800}
+RUN_LIMIT_MS = 20 * 60 * 1000  # a run still going after this is stuck: stop it
 RECORDER_RESTARTS = 3  # the camera may die and reconnect this many times before the run is stopped
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -82,7 +83,6 @@ class Run:
         self.cond = threading.Condition()
 
     def start(self) -> None:
-        self.t0 = time.time() * 1000
         threading.Thread(target=self._run, daemon=True).start()
 
     def _push(self, item: dict) -> None:
@@ -157,8 +157,8 @@ def main() -> int:
     ap.add_argument("-o", "--out", default="demo.mp4")
     args = ap.parse_args()
     load_dotenv(ROOT / ".env")
-    if not shutil.which("ffmpeg"):
-        print("ffmpeg is required", file=sys.stderr)
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        print("ffmpeg and ffprobe are required", file=sys.stderr)
         return 2
     vids = ROOT / "runs" / f"video-{time.strftime('%Y%m%d-%H%M%S')}"
     run = Run(args.url)
@@ -169,6 +169,10 @@ def main() -> int:
         if run.proc and run.proc.poll() is None:
             run.proc.terminate()
         srv.shutdown()
+
+
+class RunTimedOut(RuntimeError):
+    pass
 
 
 def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
@@ -187,14 +191,16 @@ def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
             if not started:
                 run.start()
                 started = True
-            page.wait_for_function("window.__exit !== undefined", timeout=20 * 60 * 1000, polling=1000)
+            left_ms = RUN_LIMIT_MS - (time.time() * 1000 - run.t0)  # one deadline for the whole run
+            try:
+                page.wait_for_function("window.__exit !== undefined", timeout=max(left_ms, 1000), polling=1000)
+            except PlaywrightTimeout:  # only THIS timeout means a stuck run; others are a sick browser
+                raise RunTimedOut(f"the run did not finish within {RUN_LIMIT_MS // 60000} minutes") from None
             page.wait_for_timeout(4000)
             ctx.close()
             browser.close()
             return segments + _playable(seg_dir)
-        except PlaywrightTimeout:
-            raise RuntimeError("the run did not finish within 20 minutes") from None  # a stuck run, not a crash
-        except PlaywrightError as e:
+        except PlaywrightError as e:  # crash, slow relaunch or goto timeout: reconnect
             print(f"recorder browser lost ({type(e).__name__}); reconnecting to the live stream", file=sys.stderr)
             for close in (ctx.close if ctx else None, browser.close if browser else None):
                 try:
@@ -207,16 +213,14 @@ def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
 
 
 def _playable(seg_dir: Path) -> list[Path]:
-    """Video files ffmpeg can actually read (a crash can leave a truncated or empty one)."""
+    """Video files with decodable frames (a crash can leave one empty, or truncated without a duration header)."""
     good = []
     for f in sorted(seg_dir.glob("*.webm")):
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(f)],
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+                            "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(f)],
                            capture_output=True, text=True)
-        try:
-            if r.returncode == 0 and float(r.stdout.strip() or 0) > 0.5:
-                good.append(f)
-        except ValueError:
-            pass
+        if r.returncode == 0 and r.stdout.strip().isdigit() and int(r.stdout.strip()) > 10:
+            good.append(f)
     return good
 
 

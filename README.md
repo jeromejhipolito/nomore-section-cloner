@@ -145,5 +145,5 @@ make record      # = uv run python scripts/record_run.py <url> -o demo.mp4
 `scripts/record_run.py` starts the real run and streams its output, live, into a small local page next to the
 latest compare image. Headless Playwright films that page, then films the rebuilt page at phone size, and ffmpeg
 joins the clips. Nothing is sped up, and no screen capture is involved. If the recorder's own browser dies
-mid-run, a fresh one reconnects (the log so far is shown again) and filming continues; the agent run is not
-interrupted.
+mid-run, a fresh one reconnects (the log so far is shown again) and filming continues, up to 3 times; the run
+is stopped only after that, or if it is still going after 20 minutes.
