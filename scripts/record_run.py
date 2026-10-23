@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from dotenv import load_dotenv
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from sectioncloner.show import PHONE, product_url, tour
@@ -30,6 +31,7 @@ from sectioncloner.show import PHONE, product_url, tour
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_URL = "https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis"
 SIZE = {"width": 1280, "height": 800}
+RECORDER_RESTARTS = 3  # the agent run is never killed because the camera died
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 PAGE = """<!doctype html><meta charset=utf-8><title>run</title><style>
@@ -165,33 +167,64 @@ def main() -> int:
         srv.shutdown()
 
 
+def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
+    """Film the live terminal page until the run exits. If the recorder's browser dies mid-run, the agent keeps
+    going: open a fresh browser on the same stream (it replays the log so far) and keep filming, as a new segment."""
+    segments = []
+    started = False
+    for attempt in range(1 + RECORDER_RESTARTS):
+        seg_dir = vids / f"term-{attempt}"
+        browser = p.chromium.launch()
+        ctx = browser.new_context(viewport=SIZE, record_video_dir=str(seg_dir), record_video_size=SIZE)
+        page = ctx.new_page()
+        try:
+            page.goto(f"http://127.0.0.1:{srv.server_port}/")
+            if not started:
+                run.start()
+                started = True
+            page.wait_for_function("window.__exit !== undefined", timeout=20 * 60 * 1000, polling=1000)
+            page.wait_for_timeout(4000)
+            ctx.close()
+            browser.close()
+            segments += sorted(seg_dir.glob("*.webm"))
+            return segments
+        except PlaywrightError as e:
+            print(f"recorder browser lost ({type(e).__name__}); reconnecting to the live stream", file=sys.stderr)
+            for close in (ctx.close, browser.close):
+                try:
+                    close()
+                except PlaywrightError:
+                    pass
+            segments += sorted(seg_dir.glob("*.webm"))  # whatever was filmed before it died
+    raise RuntimeError(f"recorder browser died {1 + RECORDER_RESTARTS} times")
+
+
 def _record(run: Run, srv, vids: Path, out: str) -> int:
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        ctx = browser.new_context(viewport=SIZE, record_video_dir=str(vids / "term"), record_video_size=SIZE)
-        page = ctx.new_page()
-        page.goto(f"http://127.0.0.1:{srv.server_port}/")
-        run.start()
-        page.wait_for_function("window.__exit !== undefined", timeout=20 * 60 * 1000, polling=1000)
-        page.wait_for_timeout(4000)
-        ctx.close()
+        segments = _film_terminal(p, run, srv, vids)
         if run.exit != 0:
             print(f"run failed (exit {run.exit}); terminal video kept in {vids}", file=sys.stderr)
             return run.exit
+        browser = p.chromium.launch()
         phone = browser.new_context(**PHONE, record_video_dir=str(vids / "phone"),
                                     record_video_size=PHONE["viewport"])
         tour(phone.new_page(), product_url(), os.getenv("STOREFRONT_PASSWORD", ""), hold=4)
         phone.close()
         browser.close()
-    term, ph = next((vids / "term").glob("*.webm")), next((vids / "phone").glob("*.webm"))
-    # Phone clip centred on the same 1280x800 canvas, then both joined into one h264 mp4.
-    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(term), "-i", str(ph), "-filter_complex",
-                    "[0:v]fps=30,format=yuv420p,setsar=1[a];"
-                    "[1:v]scale=-2:780,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,fps=30,format=yuv420p,"
-                    "setsar=1[b];[a][b]concat=n=2:v=1[v]",
-                    "-map", "[v]", "-c:v", "libx264", "-crf", "23", "-movflags", "+faststart", out],
-                   check=True, cwd=ROOT)
-    print(f"video: {ROOT / out}")
+    ph = next((vids / "phone").glob("*.webm"))
+    # Terminal segment(s), then the phone clip centred on the same 1280x800 canvas, joined into one h264 mp4.
+    inputs = [str(x) for x in segments] + [str(ph)]
+    chains = [f"[{i}:v]fps=30,format=yuv420p,setsar=1[v{i}]" for i in range(len(segments))]
+    chains.append(f"[{len(segments)}:v]scale=-2:780,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=0x0d1117,fps=30,"
+                  f"format=yuv420p,setsar=1[v{len(segments)}]")
+    joined = "".join(f"[v{i}]" for i in range(len(inputs)))
+    cmd = ["ffmpeg", "-loglevel", "error", "-y"]
+    for x in inputs:
+        cmd += ["-i", x]
+    cmd += ["-filter_complex", ";".join(chains) + f";{joined}concat=n={len(inputs)}:v=1[v]",
+            "-map", "[v]", "-c:v", "libx264", "-crf", "23", "-movflags", "+faststart", out]
+    subprocess.run(cmd, check=True, cwd=ROOT)
+    print(f"video: {ROOT / out}" + (f" ({len(segments)} terminal segments)" if len(segments) > 1 else ""))
     return 0
 
 
