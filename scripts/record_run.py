@@ -130,9 +130,12 @@ def serve(run: Run) -> ThreadingHTTPServer:
                         while i >= len(run.lines):
                             run.cond.wait()
                         batch, i = run.lines[i:], len(run.lines)
-                    for item in batch:
-                        self.wfile.write(f"data: {json.dumps(item)}\n\n".encode())
-                    self.wfile.flush()
+                    try:
+                        for item in batch:
+                            self.wfile.write(f"data: {json.dumps(item)}\n\n".encode())
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):  # that viewer's browser died; it reconnects
+                        return
                     if any("exit" in b for b in batch):
                         return
             elif self.path.startswith("/file?p="):
@@ -187,14 +190,19 @@ def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
             browser = p.chromium.launch()
             ctx = browser.new_context(viewport=SIZE, record_video_dir=str(seg_dir), record_video_size=SIZE)
             page = ctx.new_page()
-            page.goto(f"http://127.0.0.1:{srv.server_port}/")
-            if not started:
+            if not started:  # start before the first page load: the stream replays the log to late joiners
+                run.t0 = time.time() * 1000  # the deadline and the on-screen clock both count from here
                 run.start()
                 started = True
+            page.goto(f"http://127.0.0.1:{srv.server_port}/")
             left_ms = RUN_LIMIT_MS - (time.time() * 1000 - run.t0)  # one deadline for the whole run
+            # Once the run has exited, only the replay of its exit line is awaited: never call that a timeout.
+            wait_ms = 10_000 if run.exit is not None else max(left_ms, 10_000)
             try:
-                page.wait_for_function("window.__exit !== undefined", timeout=max(left_ms, 1000), polling=1000)
+                page.wait_for_function("window.__exit !== undefined", timeout=wait_ms, polling=1000)
             except PlaywrightTimeout:  # only THIS timeout means a stuck run; others are a sick browser
+                ctx.close()  # finalise the footage of the stuck run before stopping
+                print(f"terminal video of the stuck run kept in {seg_dir}", file=sys.stderr)
                 raise RunTimedOut(f"the run did not finish within {RUN_LIMIT_MS // 60000} minutes") from None
             page.wait_for_timeout(4000)
             ctx.close()
@@ -209,6 +217,8 @@ def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
                 except PlaywrightError:
                     pass
             segments += _playable(seg_dir)  # whatever was filmed before it died, if the file is usable
+    if segments:
+        print(f"usable footage so far: {', '.join(map(str, segments))}", file=sys.stderr)
     raise RuntimeError(f"recorder browser died {1 + RECORDER_RESTARTS} times")
 
 
@@ -216,7 +226,8 @@ def _playable(seg_dir: Path) -> list[Path]:
     """Video files with decodable frames (a crash can leave one empty, or truncated without a duration header)."""
     good = []
     for f in sorted(seg_dir.glob("*.webm")):
-        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#11",
+                            "-count_packets",
                             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(f)],
                            capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip().isdigit() and int(r.stdout.strip()) > 10:
