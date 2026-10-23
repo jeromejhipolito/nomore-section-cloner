@@ -2,7 +2,7 @@
 
 [![Recording of one full run](docs/demo-preview.gif)](https://github.com/jeromejhipolito/nomore-section-cloner/releases/download/v0.1.0/demo.mp4)
 
-**▶ [Watch the full run (4 min 14 s, real time, mp4)](https://github.com/jeromejhipolito/nomore-section-cloner/releases/download/v0.1.0/demo.mp4)**: the real
+**▶ [Watch the full run (7 min 47 s, real time, mp4)](https://github.com/jeromejhipolito/nomore-section-cloner/releases/download/v0.1.0/demo.mp4)**: the real
 `python -m sectioncloner <url>` process from start to finish, with each side-by-side compare the agent looks at as
 it appears, ending on the rebuilt page at phone size. The GIF above is a short preview of that recording.
 
@@ -119,18 +119,18 @@ make test        # offline: the hardcoded-content linter, template shape, conten
 
 ## Live run
 
-The recorded run (`runs/20261023-000442`, dev store `jerome-cloner-demo`, theme Horizon):
+The recorded run (`runs/20261023-133728`, final code, dev store `jerome-cloner-demo`, theme Horizon):
 
 | | |
 |---|---|
 | Command | `uv run python -m sectioncloner https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis` |
 | Model | `claude-sonnet-5-5` |
-| Wall time | 3 min 23 s (scrape → write → 4 compares → finish) |
-| Turns | 12 |
-| Compares used | 4 of 4 |
+| Wall time | 6 min 26 s (scrape → 2 writes + 9 edits → 3 compares → finish) |
+| Turns | 17 |
+| Compares used | 3 of 4 |
 | Height, original vs rebuild (390px wide) | 2714px vs 2690px (−0.9%, inside the 1.5% gate) |
-| **API cost** | **$2.79** (`ResultMessage.total_cost_usd`). Other full runs: $3.10, $2.86, $2.66. Hard cap: $4.50 |
-| Exit code | 0 (finish accepted after a current write + compare) |
+| **API cost** | **$2.95** (`ResultMessage.total_cost_usd`). Other full runs: $3.10, $2.86, $2.79, $2.66. Hard cap: $4.50 |
+| Exit code | 0 (finish accepted on a written, read-back and compared version) |
 | Hardcoded content in the deployed section | 0 (`lint.py` on the file read back from the store) |
 | Editable in the theme editor | every text and image is a section or block setting; images use the source CDN URLs; fonts are `font_picker` settings |
 
