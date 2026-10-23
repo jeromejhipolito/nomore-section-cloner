@@ -109,15 +109,21 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool
     with _UPLOAD_LOCK:
         if not final and _closed.is_set():
             raise ShopifyError("superseded by the final restore: not written")
+        accepted = False
         try:
             data = _upsert_request(admin, theme_id, files, idempotent=final)
+            accepted = True
             job = data.get("job")
-            if job and not job.get("done"):  # even if part of the batch was rejected, let the accepted part land
-                _wait_job(admin, job["id"])
-        except Exception:
-            if not final:  # it may have reached Shopify (or been accepted and still be running) before failing
+            # even if part of the batch was rejected, let the accepted part land
+            confirmed = _wait_job(admin, job["id"]) if job and not job.get("done") else True
+        except Exception as e:
+            # Count it only if it may still land: accepted already, or a transient failure that may have arrived.
+            # A plain 4xx / GraphQL validation error means Shopify never executed it.
+            if not final and (accepted or isinstance(e, ShopifyTransientError)):
                 unconfirmed_writes += 1
             raise
+        if not confirmed and not final:
+            unconfirmed_writes += 1
         _raise_user_errors(data["userErrors"])
 
 
@@ -132,19 +138,17 @@ def _upsert_request(admin: Admin, theme_id: str, files: dict[str, str], idempote
     )["themeFilesUpsert"]
 
 
-def _wait_job(admin: Admin, job_id: str) -> None:
-    global unconfirmed_writes
+def _wait_job(admin: Admin, job_id: str) -> bool:
+    """True when the job was seen finishing; False when Shopify dropped its record before that."""
     gone = 0
     for _ in range(JOB_POLLS):
         job = (admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id}) or {}).get("job")
         if job and job.get("done"):
-            return
+            return True
         gone = gone + 1 if job is None else 0
         if gone >= 5:  # the record keeps coming back empty: never seen finishing, so it is unconfirmed
-            unconfirmed_writes += 1
-            return
+            return False
         admin.sleep(1)
-    unconfirmed_writes += 1
     raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s")
 
 

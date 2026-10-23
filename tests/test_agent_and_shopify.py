@@ -425,4 +425,47 @@ def test_an_accepted_write_whose_job_poll_fails_counts_as_unconfirmed():
         shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
     except shopify.ShopifyTransientError:
         pass
-    assert shopify.unconfirmed_writes == 1
+    else:
+        raise AssertionError("a failed job poll must surface as a transient error")
+    assert shopify.unconfirmed_writes == 1  # counted once, not twice
+
+
+
+def test_a_rejected_request_that_never_ran_is_not_counted():
+    sent = []
+    a = _admin([(400, {"errors": "bad request"})], sent)
+    try:
+        shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    except shopify.ShopifyError:
+        pass
+    assert shopify.unconfirmed_writes == 0
+
+
+def test_settle_last_attempt_restores_once_more_if_a_late_write_keeps_landing(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    store = {}
+    run, good, uploads = _settle_run(tmp_path, monkeypatch, store)
+    monkeypatch.setattr(shopify, "unconfirmed_writes", 1)
+    real_sleep = asyncio.sleep
+    async def late_write_lands(_):  # every grace period, an earlier stale write lands on top of the restore
+        store.update({agent.SECTION_FILE: "stale"})
+        await real_sleep(0)
+    monkeypatch.setattr(agent.asyncio, "sleep", late_write_lands)
+    asyncio.run(agent.settle(run))
+    assert store == good and run.current()  # the final extra upload put the compared version back
+    assert uploads.count(True) == agent.SETTLE_TRIES + 1
+
+
+def test_compare_refuses_when_a_late_write_replaced_the_last_write(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=1))
+    run.files = {agent.SECTION_FILE: "mine", agent.TEMPLATE_FILE: '{"order": []}'}
+    run.theme_id, run.product_url = "gid://shopify/OnlineStoreTheme/1", "https://x.myshopify.com/products/p"
+    run.mutations = run.written_at = 1
+    monkeypatch.setattr(shopify, "unconfirmed_writes", 1)
+    monkeypatch.setattr(shopify, "read_files", lambda a, t, names: {agent.SECTION_FILE: "an older write",
+                                                                    agent.TEMPLATE_FILE: '{"order": []}'})
+    res = _call(tools["compare"])
+    assert res.get("is_error") and "landed late" in res["content"][0]["text"]
+    assert run.calls["compare"] == 0 and run.good is None  # free refusal, and nothing recorded as compared

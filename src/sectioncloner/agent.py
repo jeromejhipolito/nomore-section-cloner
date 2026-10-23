@@ -203,9 +203,9 @@ async def settle(run: "Run") -> None:
     3. Otherwise upload `good` as the final write and read it back; if some earlier write was never confirmed,
        wait CONFIRM_GRACE_S and read again, re-uploading if it landed meanwhile.
     Limit: a write Shopify accepted but had not applied by then can still land after this process exits."""
+    await asyncio.to_thread(shopify.close_writes)  # always: even with nothing to restore, nothing may land later
     if run.good is None or run.theme_id is None:
         return
-    await asyncio.to_thread(shopify.close_writes)
     risky = shopify.unconfirmed_writes > 0
     if risky:
         run.log(f"{shopify.unconfirmed_writes} earlier write(s) were never confirmed by Shopify: re-uploading and "
@@ -368,6 +368,11 @@ def build_tools(run: Run):
     async def compare(args):
         if run.written_at is None or run.written_at != run.mutations or run.product_url is None:
             return _pre("nothing successfully written since the last change")
+        if shopify.unconfirmed_writes and not await stored_matches(run, run.files, tries=1):
+            # an earlier unconfirmed write landed after this write's read-back: don't screenshot the wrong version
+            run.mutations += 1
+            return _pre("the store no longer holds your last write (an earlier write landed late); "
+                        "write it again with write_files, then compare")
         i = run.calls["compare"]
         # ?_v=<mutations> skips any storefront page cache that still holds the previous render
         url = f"{run.product_url}?_v={run.mutations}"
