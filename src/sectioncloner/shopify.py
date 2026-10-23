@@ -15,6 +15,9 @@ JOB_POLLS = 120  # seconds; Shopify's theme job queue can be slow
 _UPLOAD_LOCK = threading.Lock()
 # Set by the end-of-session restore: from then on no ordinary write is accepted, however late its thread runs.
 _closed = threading.Event()
+# Writes Shopify may have accepted but we never saw finish (job record dropped, polling timed out, or the request
+# failed after it may have reached Shopify). settle() treats any of these as "something may still land".
+unconfirmed_writes = 0
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
@@ -92,35 +95,48 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool
 
     final=True is the end-of-session restore: it closes the store to every later ordinary write, and (being
     idempotent) it retries network and server errors instead of giving up on the one write that must succeed."""
+    global unconfirmed_writes
     if final:
         _closed.set()
     with _UPLOAD_LOCK:
         if not final and _closed.is_set():
             raise ShopifyError("superseded by the final restore: not written")
-        data = admin.gql(
-            """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
-              themeFilesUpsert(themeId: $themeId, files: $files) {
-                upsertedThemeFiles { filename } job { id done } userErrors { field message } } }""",
-            {"themeId": theme_id,
-             "files": [{"filename": n, "body": {"type": "TEXT", "value": v}} for n, v in files.items()]},
-            idempotent=final,
-        )["themeFilesUpsert"]
+        try:
+            data = _upsert_request(admin, theme_id, files, idempotent=final)
+        except ShopifyTransientError:
+            if not final:
+                unconfirmed_writes += 1  # it may have reached Shopify before failing
+            raise
         job = data.get("job")
         if job and not job.get("done"):  # even if part of the batch was rejected, let the accepted part land
             _wait_job(admin, job["id"])
         _raise_user_errors(data["userErrors"])
 
 
+def _upsert_request(admin: Admin, theme_id: str, files: dict[str, str], idempotent: bool) -> dict:
+    return admin.gql(
+        """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
+          themeFilesUpsert(themeId: $themeId, files: $files) {
+            upsertedThemeFiles { filename } job { id done } userErrors { field message } } }""",
+        {"themeId": theme_id,
+         "files": [{"filename": n, "body": {"type": "TEXT", "value": v}} for n, v in files.items()]},
+        idempotent=idempotent,
+    )["themeFilesUpsert"]
+
+
 def _wait_job(admin: Admin, job_id: str) -> None:
+    global unconfirmed_writes
     gone = 0
     for _ in range(JOB_POLLS):
         job = (admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id}) or {}).get("job")
         if job and job.get("done"):
             return
         gone = gone + 1 if job is None else 0
-        if gone >= 5:  # the record keeps coming back empty: Shopify has dropped it; the read-back decides
+        if gone >= 5:  # the record keeps coming back empty: never seen finishing, so it is unconfirmed
+            unconfirmed_writes += 1
             return
         admin.sleep(1)
+    unconfirmed_writes += 1
     raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s")
 
 

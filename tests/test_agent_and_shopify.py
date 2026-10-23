@@ -21,6 +21,8 @@ def fresh_write_state(monkeypatch):
     from sectioncloner import agent
     monkeypatch.setattr(shopify, "_closed", threading.Event())
     monkeypatch.setattr(agent, "READ_RETRY_S", 0)
+    monkeypatch.setattr(agent, "CONFIRM_GRACE_S", 0)
+    monkeypatch.setattr(shopify, "unconfirmed_writes", 0)
 
 
 class FakeAdmin:
@@ -389,3 +391,30 @@ def test_settle_never_crashes_and_never_claims_an_unverified_store(tmp_path, mon
     asyncio.run(agent.settle(run))  # every read fails: logged, not raised
     run.finished = True
     assert not run.current() and agent.exit_code(run) == agent.EXIT_PARTIAL
+
+
+
+def test_settle_closes_the_store_even_when_nothing_needs_writing(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    store = {agent.SECTION_FILE: "{{ x }}", agent.TEMPLATE_FILE: '{"order": []}'}
+    run, good, uploads = _settle_run(tmp_path, monkeypatch, store)
+    asyncio.run(agent.settle(run))
+    assert uploads == [] and shopify._closed.is_set()  # a cancelled tool's thread can't write after this
+
+
+def test_an_unconfirmed_earlier_write_forces_the_restore_and_a_recheck(tmp_path, monkeypatch):
+    from sectioncloner import agent
+    store = {agent.SECTION_FILE: "{{ x }}", agent.TEMPLATE_FILE: '{"order": []}'}  # looks right right now...
+    run, good, uploads = _settle_run(tmp_path, monkeypatch, store)
+    monkeypatch.setattr(shopify, "unconfirmed_writes", 1)  # ...but an earlier write was never confirmed
+    asyncio.run(agent.settle(run))
+    assert uploads == [True] and store == good and run.current()
+
+
+def test_a_dropped_job_record_counts_as_unconfirmed():
+    sent = []
+    a = _admin([(200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [],
+                                                     "job": {"id": "gid://shopify/Job/1", "done": False}}}})]
+               + [(200, {"data": {"job": None}})] * 5, sent)
+    shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    assert shopify.unconfirmed_writes == 1

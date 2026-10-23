@@ -40,9 +40,11 @@ source URL ──► scrape (Playwright, 390px iPhone viewport)
 | `finish` | accepted only if the latest change was written **and** compared | 3 calls |
 
 The limits live in Python (`agent.py`), not in the prompt. Every successful compare snapshots the files it checked.
-However the session ends (an accepted `finish`, the $4.50 cap, the turn cap, an SDK error), the store is put back on
-that last compared version, uploaded in one call and read back, so a half-failed later write is not left live. (Before
-the first successful compare there is no such version to return to.) Crashed calls
+However the session ends (an accepted `finish`, the $4.50 cap, the turn cap, an SDK error), the store is closed to
+further writes and checked against that last compared version; if it differs, that version is uploaded in one call
+and read back. If Shopify never confirmed an earlier write, the restore is always done and re-checked after 20s.
+(Before the first successful compare there is no such version to return to. A write Shopify had accepted but not yet
+applied when the process exits can still land afterwards; no client can prevent that.) Crashed calls
 caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) don't use up a tool's attempts, up to 3.
 
 | Exit code | Meaning |

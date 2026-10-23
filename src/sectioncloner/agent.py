@@ -44,6 +44,7 @@ PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
 SETTLE_TRIES = 3
+CONFIRM_GRACE_S = 20  # wait before re-reading when an earlier write was never confirmed
 READ_RETRY_S = 2
 EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error · 3 finished partial · 4 Shopify down (CLI)
 FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
@@ -197,23 +198,46 @@ async def upload_verified(run: "Run", files: dict[str, str], final: bool = False
 async def settle(run: "Run") -> None:
     """However the session ended, leave the store on the last compared version (`good`), checked by reading it.
 
-    The store itself is the source of truth: if it already holds `good` nothing is written; otherwise `good` is
-    uploaded as the final write and read back, a few times, so a late-landing earlier write is overwritten too."""
+    1. Close the store to ordinary writes and wait out any write still running in a thread (a cancelled tool call).
+    2. If no write is unconfirmed and the store already holds `good`, nothing is written.
+    3. Otherwise upload `good` as the final write and read it back; if some earlier write was never confirmed,
+       wait CONFIRM_GRACE_S and read again, re-uploading if it landed meanwhile.
+    Limit: a write Shopify accepted but had not applied by then can still land after this process exits."""
     if run.good is None or run.theme_id is None:
         return
+    shopify._closed.set()
+
+    def wait_for_running_write():
+        with shopify._UPLOAD_LOCK:
+            pass
+    await asyncio.to_thread(wait_for_running_write)
+    risky = shopify.unconfirmed_writes > 0
+    if risky:
+        run.log(f"{shopify.unconfirmed_writes} earlier write(s) were never confirmed by Shopify: re-uploading and "
+                f"re-checking after {CONFIRM_GRACE_S}s")
     for attempt in range(SETTLE_TRIES):
         try:
-            if await stored_matches(run, run.good, tries=1) or await upload_verified(run, run.good, final=True):
-                if not run.current():
-                    run.mutations += 1
-                    run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations
-                    run.log("the store is back on the last compared version (read back and verified)")
-                return
+            if not risky and await stored_matches(run, run.good, tries=1):
+                return _mark_settled(run)
+            if await upload_verified(run, run.good, final=True):
+                if risky:
+                    await asyncio.sleep(CONFIRM_GRACE_S)
+                    if not await stored_matches(run, run.good, tries=1):
+                        run.log("an earlier write landed after the restore; restoring again")
+                        continue
+                return _mark_settled(run)
         except Exception as e:  # noqa: BLE001 - never let the clean-up crash the run; the exit code tells the truth
             run.log(f"settle attempt {attempt + 1}/{SETTLE_TRIES} failed: {e}")
     if run.current():  # the store could not be confirmed to hold `good`, so the run can't claim it does
         run.mutations += 1
     run.log("could not confirm the store holds the last compared version")
+
+
+def _mark_settled(run: "Run") -> None:
+    if not run.current():
+        run.mutations += 1
+        run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations
+        run.log("the store is back on the last compared version (read back and verified)")
 
 
 def fmt_cost(cost: float | None) -> str:
