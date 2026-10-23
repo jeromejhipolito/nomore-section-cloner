@@ -1,7 +1,8 @@
 """Record ONE real run as an mp4: the live terminal output of `python -m sectioncloner <url>` (with each
 side-by-side comparison the agent looks at, as it appears), then the rebuilt page at phone size.
 
-Nothing is replayed: the run starts when the recording starts. Everything is filmed by headless Playwright,
+The run starts when the recording starts. If the recorder's browser dies mid-run, a new one reconnects and the
+log so far is replayed on screen before filming continues (the gap is not filmed). Everything is filmed by headless Playwright,
 so no desktop/screen capture permission is needed and nothing else on the screen ends up in the video.
 
     uv run python scripts/record_run.py [url] [-o demo.mp4]
@@ -24,6 +25,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 from sectioncloner.show import PHONE, product_url, tour
@@ -31,7 +33,7 @@ from sectioncloner.show import PHONE, product_url, tour
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_URL = "https://try-nomore.com/products/nomorecolds-red-light-therapy-colds-sinusitis"
 SIZE = {"width": 1280, "height": 800}
-RECORDER_RESTARTS = 3  # the agent run is never killed because the camera died
+RECORDER_RESTARTS = 3  # the camera may die and reconnect this many times before the run is stopped
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 PAGE = """<!doctype html><meta charset=utf-8><title>run</title><style>
@@ -47,7 +49,7 @@ body{margin:0;background:#0d1117;color:#c9d1d9;font:13px/1.45 ui-monospace,Menlo
 <div id=log><span class=cmd>$ uv run python -m sectioncloner {CMD_URL}</span>\n</div></div>
 <div id=side><h4>Agent's latest compare: original | rebuild (390px)</h4><img id=cmp></div>
 <script>
-const log = document.getElementById('log'), t0 = Date.now();
+const log = document.getElementById('log'), t0 = {T0};  // the real run start, so every segment's clock agrees
 setInterval(() => { const s = Math.floor((Date.now() - t0) / 1000);
   document.getElementById('clock').textContent = String(s / 60 | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }, 500);
 const es = new EventSource('/events');
@@ -76,9 +78,11 @@ def classify(line: str) -> str:
 class Run:
     def __init__(self, url: str):
         self.url, self.exit, self.lines, self.images, self.proc = url, None, [], [], None
+        self.t0 = time.time() * 1000
         self.cond = threading.Condition()
 
     def start(self) -> None:
+        self.t0 = time.time() * 1000
         threading.Thread(target=self._run, daemon=True).start()
 
     def _push(self, item: dict) -> None:
@@ -115,7 +119,7 @@ def serve(run: Run) -> ThreadingHTTPServer:
 
         def do_GET(self):
             if self.path == "/":
-                body = PAGE.replace("{CMD_URL}", html.escape(run.url)).encode()
+                body = PAGE.replace("{CMD_URL}", html.escape(run.url)).replace("{T0}", str(int(run.t0))).encode()
                 self.send_response(200), self.send_header("Content-Type", "text/html"), self.end_headers()
                 self.wfile.write(body)
             elif self.path == "/events":
@@ -168,16 +172,17 @@ def main() -> int:
 
 
 def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
-    """Film the live terminal page until the run exits. If the recorder's browser dies mid-run, the agent keeps
-    going: open a fresh browser on the same stream (it replays the log so far) and keep filming, as a new segment."""
+    """Film the live terminal page until the run exits. If the recorder's browser dies (or won't relaunch), the
+    agent keeps going: open a fresh browser on the same stream (it replays the log so far) as a new segment."""
     segments = []
     started = False
     for attempt in range(1 + RECORDER_RESTARTS):
         seg_dir = vids / f"term-{attempt}"
-        browser = p.chromium.launch()
-        ctx = browser.new_context(viewport=SIZE, record_video_dir=str(seg_dir), record_video_size=SIZE)
-        page = ctx.new_page()
+        browser = ctx = None
         try:
+            browser = p.chromium.launch()
+            ctx = browser.new_context(viewport=SIZE, record_video_dir=str(seg_dir), record_video_size=SIZE)
+            page = ctx.new_page()
             page.goto(f"http://127.0.0.1:{srv.server_port}/")
             if not started:
                 run.start()
@@ -186,17 +191,33 @@ def _film_terminal(p, run: Run, srv, vids: Path) -> list[Path]:
             page.wait_for_timeout(4000)
             ctx.close()
             browser.close()
-            segments += sorted(seg_dir.glob("*.webm"))
-            return segments
+            return segments + _playable(seg_dir)
+        except PlaywrightTimeout:
+            raise RuntimeError("the run did not finish within 20 minutes") from None  # a stuck run, not a crash
         except PlaywrightError as e:
             print(f"recorder browser lost ({type(e).__name__}); reconnecting to the live stream", file=sys.stderr)
-            for close in (ctx.close, browser.close):
+            for close in (ctx.close if ctx else None, browser.close if browser else None):
                 try:
-                    close()
+                    if close:
+                        close()
                 except PlaywrightError:
                     pass
-            segments += sorted(seg_dir.glob("*.webm"))  # whatever was filmed before it died
+            segments += _playable(seg_dir)  # whatever was filmed before it died, if the file is usable
     raise RuntimeError(f"recorder browser died {1 + RECORDER_RESTARTS} times")
+
+
+def _playable(seg_dir: Path) -> list[Path]:
+    """Video files ffmpeg can actually read (a crash can leave a truncated or empty one)."""
+    good = []
+    for f in sorted(seg_dir.glob("*.webm")):
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(f)],
+                           capture_output=True, text=True)
+        try:
+            if r.returncode == 0 and float(r.stdout.strip() or 0) > 0.5:
+                good.append(f)
+        except ValueError:
+            pass
+    return good
 
 
 def _record(run: Run, srv, vids: Path, out: str) -> int:
