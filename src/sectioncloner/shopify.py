@@ -90,6 +90,14 @@ def main_theme_id(admin: Admin) -> str:
     return nodes[0]["id"]
 
 
+def close_writes(wait: bool = True) -> None:
+    """Refuse every later ordinary write; with wait=True, also let a write already running finish first."""
+    _closed.set()
+    if wait:
+        with _UPLOAD_LOCK:
+            pass
+
+
 def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool = False) -> None:
     """Write text files to the theme. Shopify validates Liquid/JSON here and returns userErrors.
 
@@ -97,19 +105,19 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool
     idempotent) it retries network and server errors instead of giving up on the one write that must succeed."""
     global unconfirmed_writes
     if final:
-        _closed.set()
+        close_writes(wait=False)
     with _UPLOAD_LOCK:
         if not final and _closed.is_set():
             raise ShopifyError("superseded by the final restore: not written")
         try:
             data = _upsert_request(admin, theme_id, files, idempotent=final)
-        except ShopifyTransientError:
-            if not final:
-                unconfirmed_writes += 1  # it may have reached Shopify before failing
+            job = data.get("job")
+            if job and not job.get("done"):  # even if part of the batch was rejected, let the accepted part land
+                _wait_job(admin, job["id"])
+        except Exception:
+            if not final:  # it may have reached Shopify (or been accepted and still be running) before failing
+                unconfirmed_writes += 1
             raise
-        job = data.get("job")
-        if job and not job.get("done"):  # even if part of the batch was rejected, let the accepted part land
-            _wait_job(admin, job["id"])
         _raise_user_errors(data["userErrors"])
 
 

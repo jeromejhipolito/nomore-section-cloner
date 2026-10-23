@@ -205,12 +205,7 @@ async def settle(run: "Run") -> None:
     Limit: a write Shopify accepted but had not applied by then can still land after this process exits."""
     if run.good is None or run.theme_id is None:
         return
-    shopify._closed.set()
-
-    def wait_for_running_write():
-        with shopify._UPLOAD_LOCK:
-            pass
-    await asyncio.to_thread(wait_for_running_write)
+    await asyncio.to_thread(shopify.close_writes)
     risky = shopify.unconfirmed_writes > 0
     if risky:
         run.log(f"{shopify.unconfirmed_writes} earlier write(s) were never confirmed by Shopify: re-uploading and "
@@ -224,6 +219,8 @@ async def settle(run: "Run") -> None:
                     await asyncio.sleep(CONFIRM_GRACE_S)
                     if not await stored_matches(run, run.good, tries=1):
                         run.log("an earlier write landed after the restore; restoring again")
+                        if attempt == SETTLE_TRIES - 1 and await upload_verified(run, run.good, final=True):
+                            return _mark_settled(run)  # last chance: put it back once more, no further grace
                         continue
                 return _mark_settled(run)
         except Exception as e:  # noqa: BLE001 - never let the clean-up crash the run; the exit code tells the truth

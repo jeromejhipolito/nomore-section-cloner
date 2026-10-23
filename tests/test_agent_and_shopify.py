@@ -350,6 +350,7 @@ def test_a_job_record_shopify_dropped_does_not_stall_the_write():
                + [gone] * 5, sent)
     shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
     assert len(sent) == 6  # 1 write + 5 empty polls, then the read-back is left to decide
+    assert shopify.unconfirmed_writes == 1  # never seen finishing: settle() will treat the store as at risk
 
 
 def _settle_run(tmp_path, monkeypatch, store, read_error=None):
@@ -411,10 +412,17 @@ def test_an_unconfirmed_earlier_write_forces_the_restore_and_a_recheck(tmp_path,
     assert uploads == [True] and store == good and run.current()
 
 
-def test_a_dropped_job_record_counts_as_unconfirmed():
-    sent = []
-    a = _admin([(200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [],
-                                                     "job": {"id": "gid://shopify/Job/1", "done": False}}}})]
-               + [(200, {"data": {"job": None}})] * 5, sent)
-    shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+
+def test_an_accepted_write_whose_job_poll_fails_counts_as_unconfirmed():
+    def handler(request):
+        if b"themeFilesUpsert" in request.content:
+            return httpx.Response(200, json={"data": {"themeFilesUpsert": {
+                "upsertedThemeFiles": [], "userErrors": [], "job": {"id": "gid://shopify/Job/1", "done": False}}}})
+        raise httpx.ReadTimeout("poll lost")
+    a = shopify.Admin("s.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(handler)),
+                      sleep=lambda s: None)
+    try:
+        shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    except shopify.ShopifyTransientError:
+        pass
     assert shopify.unconfirmed_writes == 1
