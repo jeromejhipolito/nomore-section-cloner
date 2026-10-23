@@ -13,7 +13,14 @@ JOB_POLLS = 120  # seconds; Shopify's theme job queue can be slow
 # One theme write at a time, for the whole process: an upload left running by a cancelled tool call, or a job
 # that outlived its polling, finishes BEFORE the next write (e.g. the final restore) starts, so it can't land after.
 _UPLOAD_LOCK = threading.Lock()
-_pending_jobs: list[str] = []  # theme write jobs we stopped polling before they were done
+# Jobs we stopped waiting on before they were confirmed done. None = a write whose request failed in flight, so
+# Shopify may or may not have accepted it: the next write gives it UNCONFIRMED_GRACE_S to land first.
+_pending_jobs: list[str | None] = []
+UNCONFIRMED_GRACE_S = 20
+# The final restore bumps the generation; an ordinary write still queued behind the lock from before then is
+# stale (its tool call was cancelled) and is refused instead of landing after the restore.
+_generation = 0
+_gen_lock = threading.Lock()
 SCOPES = {"read_products", "write_products", "read_themes", "write_themes", "read_publications", "write_publications"}
 
 
@@ -37,14 +44,14 @@ class Admin:
         self.headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
         self.sleep = sleep
 
-    def gql(self, query: str, variables: dict | None = None) -> dict:
+    def gql(self, query: str, variables: dict | None = None, retry_transport: bool = True) -> dict:
         for attempt in range(5):
             try:
                 r = self.http.post(self.url, json={"query": query, "variables": variables or {}},
                                    headers=self.headers)
                 body = r.json() if r.status_code == 200 else None
             except httpx.TransportError as e:  # DNS / reset / timeout: retry, then a clean error
-                if attempt < 4:
+                if attempt < 4 and retry_transport:  # never blindly re-send a write that may have landed
                     self.sleep(min(2**attempt, 20))
                     continue
                 raise ShopifyTransientError(f"cannot reach {self.domain}: {e}") from e
@@ -79,40 +86,68 @@ def main_theme_id(admin: Admin) -> str:
     return nodes[0]["id"]
 
 
-def upsert_files(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
-    """Write text files to the theme. Shopify validates Liquid/JSON here and returns userErrors."""
+def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool = False) -> None:
+    """Write text files to the theme. Shopify validates Liquid/JSON here and returns userErrors.
+
+    final=True is the end-of-session restore: it supersedes any ordinary write still waiting for the lock."""
+    global _generation
+    with _gen_lock:
+        if final:
+            _generation += 1
+        mine = _generation
     with _UPLOAD_LOCK:
-        while _pending_jobs:  # an earlier write still running on Shopify's side must not land after this one
-            _wait_job(admin, _pending_jobs[0])
-            _pending_jobs.pop(0)
+        if not final and mine != _generation:
+            raise ShopifyError("superseded by the final restore: not written")
+        _drain_pending(admin)
         _upsert(admin, theme_id, files)
+
+
+def _drain_pending(admin: Admin) -> None:
+    """Let every earlier write land before this one. Bounded: a job that can't be confirmed is waited out once."""
+    while _pending_jobs:
+        job_id = _pending_jobs.pop(0)
+        try:
+            if job_id is None:
+                admin.sleep(UNCONFIRMED_GRACE_S)
+            else:
+                _wait_job(admin, job_id)
+        except ShopifyError:  # can't confirm it (still running / unknown id): give it the grace period, move on
+            admin.sleep(UNCONFIRMED_GRACE_S)
 
 
 def _wait_job(admin: Admin, job_id: str) -> None:
     for _ in range(JOB_POLLS):
-        if admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id})["job"]["done"]:
+        job = admin.gql("query($id: ID!) { job(id: $id) { id done } }", {"id": job_id})["job"]
+        if job is None or job["done"]:  # None: Shopify no longer knows the job, i.e. it is long finished
             return
         admin.sleep(1)
     raise ShopifyTransientError(f"theme write job {job_id} still not done after {JOB_POLLS}s")
 
 
 def _upsert(admin: Admin, theme_id: str, files: dict[str, str]) -> None:
-    data = admin.gql(
+    try:
+        data = _upsert_request(admin, theme_id, files)
+    except ShopifyTransientError:
+        _pending_jobs.append(None)  # it may have been accepted: the next write waits for it to land
+        raise
+    _raise_user_errors(data["userErrors"])
+    job = data.get("job")
+    if not job or job.get("done"):
+        return
+    _pending_jobs.append(job["id"])  # tracked BEFORE waiting, so no failure path can drop it
+    _wait_job(admin, job["id"])
+    _pending_jobs.remove(job["id"])
+
+
+def _upsert_request(admin: Admin, theme_id: str, files: dict[str, str]) -> dict:
+    return admin.gql(
         """mutation($themeId: ID!, $files: [OnlineStoreThemeFilesUpsertFileInput!]!) {
           themeFilesUpsert(themeId: $themeId, files: $files) {
             upsertedThemeFiles { filename } job { id done } userErrors { field message } } }""",
         {"themeId": theme_id,
          "files": [{"filename": n, "body": {"type": "TEXT", "value": v}} for n, v in files.items()]},
+        retry_transport=False,
     )["themeFilesUpsert"]
-    _raise_user_errors(data["userErrors"])
-    job = data.get("job")
-    if not job or job.get("done"):
-        return
-    try:  # the write can finish in the background; a read-back before then sees old content
-        _wait_job(admin, job["id"])
-    except ShopifyTransientError:
-        _pending_jobs.append(job["id"])  # the next write waits for it first
-        raise
 
 
 def missing_scopes(admin: Admin, needed: set[str]) -> list[str]:

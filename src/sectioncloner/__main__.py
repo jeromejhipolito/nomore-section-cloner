@@ -37,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     # Fail here, for free, instead of after the agent has spent money on a write it isn't allowed to make.
     try:
         lacking = shopify.missing_scopes(admin, shopify.SCOPES)
+    except shopify.ShopifyTransientError as e:
+        print(f"Shopify is unreachable or erroring right now (not a config problem), retry: {e}", file=sys.stderr)
+        return 2
     except shopify.ShopifyError as e:
         print(f"cannot use the Admin API token: {e}", file=sys.stderr)
         return 2

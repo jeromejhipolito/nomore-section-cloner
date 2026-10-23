@@ -48,12 +48,13 @@ caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) 
 | Exit code | Meaning |
 |---|---|
 | `0` | done: `finish` accepted, and the store holds exactly the last written, read-back **and** compared version |
-| `1` | no compared version exists (even if `finish` was accepted), or the session ended without an accepted `finish` (the store is still put back if a compared version exists) |
+| `1` | no compared version exists (even if `finish` was accepted), or the session ended without an accepted `finish` (putting the last compared version back is still attempted; the log says if it worked) |
 | `2` | usage/config error before the agent started (bad URL, missing `.env` key, token scopes) |
 | `3` | `finish` accepted, but the store could not be put back on the last compared version (the log says why) |
 
 Once the agent has started, the run's final status line includes its **API cost** (`ResultMessage.total_cost_usd`), even
-when it fails. Exit `2` stops before the agent starts, so it costs nothing.
+when it fails; it reads `unknown` only if the SDK never reported a result. Exit `2` stops before the agent starts, so it
+costs nothing (a temporary Shopify outage at that point is reported as such, so retry).
 
 ### "No hardcoded content" is enforced, not requested
 

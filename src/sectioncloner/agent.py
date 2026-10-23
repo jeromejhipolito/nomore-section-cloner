@@ -170,9 +170,9 @@ def is_transient(e: Exception) -> bool:
     return isinstance(e, (ConnectionError, TimeoutError, PlaywrightError, shopify.ShopifyTransientError))
 
 
-async def upload_verified(run: "Run", files: dict[str, str]) -> bool:
+async def upload_verified(run: "Run", files: dict[str, str], final: bool = False) -> bool:
     """Upload section + template in ONE call, then read both back. True only if the store holds exactly `files`."""
-    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, files)  # serialised in shopify.py
+    await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, files, final)  # serialised in shopify.py
     back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
     try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
         same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
@@ -186,7 +186,7 @@ async def settle(run: "Run") -> None:
     if run.good is None or run.current():
         return
     try:
-        ok = await upload_verified(run, run.good)
+        ok = await upload_verified(run, run.good, final=True)
     except Exception as e:  # noqa: BLE001 - reported, and the exit code says partial/failed
         run.log(f"could not put the last compared version back live: {e}")
         return

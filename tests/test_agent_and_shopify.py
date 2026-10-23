@@ -186,7 +186,8 @@ def test_finish_accepted_when_no_budget_path_remains_then_settle_decides_the_exi
     run.theme_id = "gid://shopify/OnlineStoreTheme/1"
     run.calls["compare"] = BUDGET["compare"]  # and every compare is used
     assert not _call(tools["finish"], {"report": "x"}).get("is_error") and run.finished
-    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, f: (_ for _ in ()).throw(shopify.ShopifyError("no")))
+    monkeypatch.setattr(shopify, "upsert_files",
+                        lambda a, t, f, final=False: (_ for _ in ()).throw(shopify.ShopifyError("no")))
     asyncio.run(agent.settle(run))
     assert agent.exit_code(run) == agent.EXIT_PARTIAL  # could not put it back: partial
 
@@ -231,10 +232,11 @@ def test_settle_puts_the_last_compared_version_back_however_the_session_ended(tm
     run.mutations, run.written_at, run.compared_at = 3, 2, 2  # half-failed write, session then hit its budget
     store = {}
     calls = []
-    monkeypatch.setattr(shopify, "upsert_files", lambda a, t, files: (calls.append(sorted(files)), store.update(files)))
+    monkeypatch.setattr(shopify, "upsert_files",
+                        lambda a, t, files, final=False: (calls.append((sorted(files), final)), store.update(files)))
     monkeypatch.setattr(shopify, "read_files", lambda a, t, names: {n: store[n] for n in names})
     asyncio.run(agent.settle(run))
-    assert store == good and calls == [sorted(good)]  # both files in ONE upload
+    assert store == good and calls == [(sorted(good), True)]  # both files in ONE upload, as the final restore
     assert run.current() and agent.exit_code(run) == 1  # store is safe, but the session never finished
     run.finished = True
     assert agent.exit_code(run) == 0
@@ -294,3 +296,55 @@ def test_a_job_that_outlived_polling_finishes_before_the_next_write(monkeypatch)
     shopify.upsert_files(a, "gid://shopify/OnlineStoreTheme/1", {"sections/x.liquid": "2"})  # e.g. the restore
     kinds = ["upsert" if "themeFilesUpsert" in q["query"] else "job" for q in sent]
     assert kinds == ["upsert", "job", "job", "job", "upsert"] and shopify._pending_jobs == []
+
+
+
+def test_a_stale_queued_write_is_refused_after_the_final_restore(monkeypatch):
+    monkeypatch.setattr(shopify, "_pending_jobs", [])
+    monkeypatch.setattr(shopify, "_generation", 0)
+    ok = {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}}
+    sent = []
+    a = _admin([(200, ok)], sent)
+    with shopify._UPLOAD_LOCK:  # an orphan write is queued behind the lock...
+        import threading
+        result = {}
+        def orphan():
+            try:
+                shopify.upsert_files(a, "t", {"sections/x.liquid": "stale"})
+            except shopify.ShopifyError as e:
+                result["err"] = str(e)
+        t = threading.Thread(target=orphan); t.start()
+        import time; time.sleep(0.2)
+        with shopify._gen_lock:  # ...when settle() starts the final restore
+            shopify._generation += 1
+    t.join(5)
+    assert "superseded" in result.get("err", "") and sent == []  # the stale write never reached Shopify
+
+
+def test_unknown_job_counts_as_finished_and_unconfirmed_writes_get_a_grace(monkeypatch):
+    monkeypatch.setattr(shopify, "_pending_jobs", [None, "gid://shopify/Job/9"])
+    monkeypatch.setattr(shopify, "_generation", 0)
+    slept = []
+    sent = []
+    a = _admin([(200, {"data": {"job": None}}),  # Shopify no longer knows job 9: finished
+                (200, {"data": {"themeFilesUpsert": {"upsertedThemeFiles": [], "userErrors": [], "job": None}}})],
+               sent)
+    a.sleep = slept.append
+    shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    assert slept == [shopify.UNCONFIRMED_GRACE_S] and shopify._pending_jobs == []
+
+
+def test_a_write_that_failed_in_flight_is_not_resent_and_is_waited_out_next_time(monkeypatch):
+    monkeypatch.setattr(shopify, "_pending_jobs", [])
+    monkeypatch.setattr(shopify, "_generation", 0)
+    calls = []
+    def flaky(request):
+        calls.append(1)
+        raise httpx.ReadTimeout("timed out")
+    a = shopify.Admin("s.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(flaky)),
+                      sleep=lambda s: None)
+    try:
+        shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    except shopify.ShopifyTransientError:
+        pass
+    assert len(calls) == 1 and shopify._pending_jobs == [None]  # not re-sent; next write gives it a grace period
