@@ -469,3 +469,39 @@ def test_compare_refuses_when_a_late_write_replaced_the_last_write(tmp_path, mon
     res = _call(tools["compare"])
     assert res.get("is_error") and "landed late" in res["content"][0]["text"]
     assert run.calls["compare"] == 0 and run.good is None  # free refusal, and nothing recorded as compared
+    assert run.mutations == 2 and run.written_at == 1  # the live files are no longer the last written ones
+
+
+
+def test_compare_refuses_when_a_late_write_lands_during_the_screenshot(tmp_path, monkeypatch):
+    from sectioncloner import agent, browser
+    run, tools = _tools(tmp_path)
+    run.source = Source(url="u", digest="", images=[], texts=[], shot=Shot(height=1))
+    mine = {agent.SECTION_FILE: "mine", agent.TEMPLATE_FILE: '{"order": []}'}
+    store = dict(mine)
+    run.files, run.theme_id = mine, "gid://shopify/OnlineStoreTheme/1"
+    run.product_url = "https://x.myshopify.com/products/p"
+    run.mutations = run.written_at = 1
+    monkeypatch.setattr(shopify, "unconfirmed_writes", 1)
+    monkeypatch.setattr(shopify, "read_files", lambda a, t, names: {n: store[n] for n in names})
+
+    def screenshot_while_an_old_write_lands(*a, **k):
+        store[agent.SECTION_FILE] = "an older write"
+        return Shot(height=1)
+    monkeypatch.setattr(browser, "shoot_rebuild", screenshot_while_an_old_write_lands)
+    res = _call(tools["compare"])
+    assert res.get("is_error") and run.good is None and run.compared_at is None
+
+
+def test_a_non_http_error_after_sending_counts_as_unconfirmed():
+    def handler(request):
+        return httpx.Response(200, json={"no_data_key": True})  # a 200 with no `data`: KeyError after sending
+    a = shopify.Admin("s.myshopify.com", "t", client=httpx.Client(transport=httpx.MockTransport(handler)),
+                      sleep=lambda s: None)
+    try:
+        shopify.upsert_files(a, "t", {"sections/x.liquid": "1"})
+    except Exception:
+        pass
+    else:
+        raise AssertionError("expected an error")
+    assert shopify.unconfirmed_writes == 1

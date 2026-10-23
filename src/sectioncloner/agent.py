@@ -230,6 +230,18 @@ async def settle(run: "Run") -> None:
     run.log("could not confirm the store holds the last compared version")
 
 
+async def store_moved(run: "Run") -> bool:
+    """Only while an earlier write is unconfirmed: does the store no longer hold the last write? (2 reads, so one
+    briefly stale read doesn't force a rewrite.)"""
+    return bool(shopify.unconfirmed_writes) and not await stored_matches(run, run.files, tries=2)
+
+
+def _store_moved_refusal(run: "Run") -> dict:
+    run.mutations += 1  # the live files are not the last written ones any more
+    return _pre("the store no longer holds your last write (an earlier write landed late): write it again "
+                "(write_files, or edit_file with old == new), then compare")
+
+
 def _mark_settled(run: "Run") -> None:
     if not run.current():
         run.mutations += 1
@@ -368,15 +380,14 @@ def build_tools(run: Run):
     async def compare(args):
         if run.written_at is None or run.written_at != run.mutations or run.product_url is None:
             return _pre("nothing successfully written since the last change")
-        if shopify.unconfirmed_writes and not await stored_matches(run, run.files, tries=1):
-            # an earlier unconfirmed write landed after this write's read-back: don't screenshot the wrong version
-            run.mutations += 1
-            return _pre("the store no longer holds your last write (an earlier write landed late); "
-                        "write it again with write_files, then compare")
+        if await store_moved(run):  # an earlier unconfirmed write landed after this write's read-back
+            return _store_moved_refusal(run)
         i = run.calls["compare"]
         # ?_v=<mutations> skips any storefront page cache that still holds the previous render
         url = f"{run.product_url}?_v={run.mutations}"
         shot = await asyncio.to_thread(browser.shoot_rebuild, url, run.password, run.out, f"rebuild{i}")
+        if await store_moved(run):  # ...or landed while the screenshot was being taken
+            return _store_moved_refusal(run)
         pairs = await asyncio.to_thread(browser.side_by_side, run.source.shot, shot, run.out, f"cmp{i}")
         run.compared_at = run.mutations
         run.good = run.files  # the version settle() falls back to, however the session ends

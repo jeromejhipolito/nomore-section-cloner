@@ -117,9 +117,10 @@ def upsert_files(admin: Admin, theme_id: str, files: dict[str, str], final: bool
             # even if part of the batch was rejected, let the accepted part land
             confirmed = _wait_job(admin, job["id"]) if job and not job.get("done") else True
         except Exception as e:
-            # Count it only if it may still land: accepted already, or a transient failure that may have arrived.
-            # A plain 4xx / GraphQL validation error means Shopify never executed it.
-            if not final and (accepted or isinstance(e, ShopifyTransientError)):
+            # Count it only if it may still land: accepted already, a transient failure, or any non-HTTP error
+            # after sending (e.g. a body that won't decode). A plain 4xx / validation error was never executed.
+            never_ran = isinstance(e, ShopifyError) and not isinstance(e, ShopifyTransientError)
+            if not final and (accepted or not never_ran):
                 unconfirmed_writes += 1
             raise
         if not confirmed and not final:
