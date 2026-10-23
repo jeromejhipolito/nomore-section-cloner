@@ -51,8 +51,8 @@ caused by infrastructure (network, Shopify 5xx/throttling, a browser that died) 
 | `1` | nothing was built, or the session ended without an accepted `finish` (the store is still put back if a compared version exists) |
 | `2` | usage/config error before the agent started (bad URL, missing `.env` key, token scopes) |
 | `3` | `finish` accepted, but the store could not be put back on the last compared version (the log says why) |
- The process exits `0` only after an accepted `finish`,
-and always prints the run's **API cost** (`ResultMessage.total_cost_usd`).
+
+Every run prints its **API cost** (`ResultMessage.total_cost_usd`) as the last line, even when it fails.
 
 ### "No hardcoded content" is enforced, not requested
 
