@@ -43,6 +43,8 @@ TEMPLATE_KEY = browser.TEMPLATE_KEY  # one constant: the screenshot selector is 
 PRODUCT_HANDLE = "nomore-landing-placeholder"
 PRODUCT_TITLE, PRODUCT_PRICE = "NoMore Colds (placeholder)", "49.00"  # AC: a placeholder product is enough
 HEIGHT_TOLERANCE = 0.015  # finish needs the rebuild within 1.5% of the original's height (while compares remain)
+SETTLE_TRIES = 3
+READ_RETRY_S = 2
 EXIT_PARTIAL = 3  # 0 done · 1 never finished · 2 config/usage error · 3 finished partial · 4 Shopify down (CLI)
 FAILURE_CAP = 3  # crashed tool calls that are forgiven before crashes start costing budget
 MAX_BUDGET_USD = 4.5  # hard stop below the $5 a run is allowed to cost
@@ -170,39 +172,48 @@ def is_transient(e: Exception) -> bool:
     return isinstance(e, (ConnectionError, TimeoutError, PlaywrightError, shopify.ShopifyTransientError))
 
 
+async def stored_matches(run: "Run", files: dict[str, str], tries: int = 3) -> bool:
+    """Does the store hold exactly `files`? Re-reads a few times: a just-finished write can take a moment to show."""
+    for attempt in range(tries):
+        back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
+        try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
+            same_template = (shopify.parse_template(back.get(TEMPLATE_FILE, "null"))
+                             == json.loads(files[TEMPLATE_FILE]))
+        except (json.JSONDecodeError, ValueError):
+            same_template = False
+        if back.get(SECTION_FILE) == files[SECTION_FILE] and same_template:
+            return True
+        if attempt < tries - 1:
+            await asyncio.sleep(READ_RETRY_S)
+    return False
+
+
 async def upload_verified(run: "Run", files: dict[str, str], final: bool = False) -> bool:
     """Upload section + template in ONE call, then read both back. True only if the store holds exactly `files`."""
     await asyncio.to_thread(shopify.upsert_files, run.admin, run.theme_id, files, final)  # serialised in shopify.py
-    back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
-    try:  # Shopify reformats template JSON and adds a comment header, so compare parsed values
-        same_template = shopify.parse_template(back.get(TEMPLATE_FILE, "null")) == json.loads(files[TEMPLATE_FILE])
-    except (json.JSONDecodeError, ValueError):
-        same_template = False
-    return back.get(SECTION_FILE) == files[SECTION_FILE] and same_template
+    return await stored_matches(run, files)
 
 
 async def settle(run: "Run") -> None:
-    """However the session ended, leave the store on the last compared version (`good`)."""
-    if run.good is None or run.current():
+    """However the session ended, leave the store on the last compared version (`good`), checked by reading it.
+
+    The store itself is the source of truth: if it already holds `good` nothing is written; otherwise `good` is
+    uploaded as the final write and read back, a few times, so a late-landing earlier write is overwritten too."""
+    if run.good is None or run.theme_id is None:
         return
-    try:
-        ok = await upload_verified(run, run.good, final=True)
-    except Exception as e:  # noqa: BLE001 - reported, and the exit code says partial/failed
-        run.log(f"could not put the last compared version back live: {e}")
-        return
-    if ok and shopify.lost_track:  # an earlier write we lost track of could still land: look again after a grace
-        run.log(f"{shopify.lost_track} earlier write(s) could not be confirmed; re-checking the store after "
-                f"{shopify.UNCONFIRMED_GRACE_S}s")
-        await asyncio.sleep(shopify.UNCONFIRMED_GRACE_S)
-        back = await asyncio.to_thread(shopify.read_files, run.admin, run.theme_id, [SECTION_FILE, TEMPLATE_FILE])
-        ok = back.get(SECTION_FILE) == run.good[SECTION_FILE] and shopify.parse_template(
-            back.get(TEMPLATE_FILE, "null")) == json.loads(run.good[TEMPLATE_FILE])
-    if ok:
+    for attempt in range(SETTLE_TRIES):
+        try:
+            if await stored_matches(run, run.good, tries=1) or await upload_verified(run, run.good, final=True):
+                if not run.current():
+                    run.mutations += 1
+                    run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations
+                    run.log("the store is back on the last compared version (read back and verified)")
+                return
+        except Exception as e:  # noqa: BLE001 - never let the clean-up crash the run; the exit code tells the truth
+            run.log(f"settle attempt {attempt + 1}/{SETTLE_TRIES} failed: {e}")
+    if run.current():  # the store could not be confirmed to hold `good`, so the run can't claim it does
         run.mutations += 1
-        run.files, run.written_at, run.compared_at = run.good, run.mutations, run.mutations  # identical content
-        run.log("put the last compared version back live (read back and verified)")
-    else:
-        run.log("putting the last compared version back live did not read back identically")
+    run.log("could not confirm the store holds the last compared version")
 
 
 def fmt_cost(cost: float | None) -> str:
